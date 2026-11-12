@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="OIDC flow">
+  <rect width="32" height="32" rx="7" fill="#08070a"/>
+  <!-- Sankey-ish flows: left → mid → right, accent teal -->
+  <path
+    fill="#3ed6c6"
+    fill-opacity="0.35"
+    d="M6 8h3c4 0 5 4 9 4h8v4h-8c-5 0-6-4-10-4H6V8z"
+  />
+  <path
+    fill="#3ed6c6"
+    fill-opacity="0.7"
+    d="M6 14h3c5 0 6 3 10 3h8v3h-8c-5 0-6-3-11-3H6v-3z"
+  />
+  <path
+    fill="#3ed6c6"
+    d="M6 20h2c6 0 7 3 11 3h7v3h-7c-5 0-6-3-12-3H6v-3z"
+  />
+  <rect x="5" y="7" width="4" height="17" rx="1.5" fill="#3ed6c6"/>
+  <rect x="14" y="10" width="3.5" height="12" rx="1.2" fill="#2a9d90"/>
+  <rect x="23" y="11" width="4" height="13" rx="1.5" fill="#3ed6c6"/>
+</svg>
