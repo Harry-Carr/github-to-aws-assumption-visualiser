@@ -1,0 +1,14 @@
+.venv/
+cli/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+dist/
+web/dist/
+web/node_modules/
+.env
+.env.*
+!.env.example
+.DS_Store

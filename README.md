@@ -1,2 +1,69 @@
-# github-to-aws-assumption-visualiser
-UI to visualise GitHub to AWS role assumptions, allows users to identify potential risks relating to least-privilege and blast radius
+# GitHub OIDC CloudTrail flow
+
+Browser app that queries AWS CloudTrail for GitHub Actions OIDC assumes and draws a **Sankey** of org → repo → branch/env → IAM role (thicker / deeper teal = more assumes). Vite + TypeScript SPA under [`web/`](web/) — no backend; AWS SDK v3 runs in the browser.
+
+## Quick start
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Open the printed local URL. Provide:
+
+| Field | Notes |
+|-------|--------|
+| Access key / secret | Or paste temporary keys from `aws sts assume-role` |
+| Session token | Optional; recommended |
+| Regions | Dropdown multi-select (comma-separated summary); CloudTrail **Event History is regional** — pick every region where events may appear |
+| Lookback days | 1–90 (API limit ~90 days) |
+
+Credentials stay in memory only and are sent only to `*.amazonaws.com`. Prefer a short-lived session token.
+
+Then **Scan CloudTrail**. The app:
+
+1. Paginates `LookupEvents` for `AssumeRoleWithWebIdentity` in each selected region
+2. Keeps events from `token.actions.githubusercontent.com` (GitHub OIDC)
+3. Aggregates by org/repo (and workflow when present) × role
+4. Renders an ECharts Sankey (`org → repo → branch|env → role`); branch/env column toggle; click for detail; export CSV
+
+```bash
+npm run build     # → web/dist (relative asset paths for GitHub Pages)
+npm run preview   # serve the build locally
+npm run test:parse
+```
+
+## GitHub Pages
+
+Vite `base` is `./` so the build works under `https://<user>.github.io/<repo>/`. Workflow [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) builds `web/` and publishes via **Actions → Pages**.
+
+Enable once: repo **Settings → Pages → Source: GitHub Actions**.
+
+Treat the hosted page like any third-party site when pasting AWS credentials — use short-lived tokens only.
+
+## IAM
+
+Minimum for the scan identity:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["cloudtrail:LookupEvents"],
+  "Resource": "*"
+}
+```
+
+## Limits
+
+- `LookupEvents` can be slow and throttled on busy accounts — use Cancel if needed.
+- Workflow file names are **best-effort**; CloudTrail often only has `repo:…:ref:…` subjects → `unknown` workflow bucket.
+- Roles appear only if they were **assumed** in the lookback window (no IAM ListRoles in v1).
+- Do not paste long-lived keys into a page you do not host/trust.
+
+## Layout
+
+| Path | Purpose |
+|------|---------|
+| `web/` | Vite + TypeScript SPA (source, `public/`, package manifests) |
+| `.github/workflows/` | GitHub Pages build + deploy |
