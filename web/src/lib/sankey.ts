@@ -40,11 +40,6 @@ export function countToAccent(count: number, maxCount: number): string {
   return `rgb(${r},${g},${b})`;
 }
 
-/** Compress giant paths so small flows stay visible; floor avoids hairlines. */
-export function visualWeight(count: number): number {
-  return Math.max(0.4, Math.sqrt(Math.max(0, count)));
-}
-
 const NODE_GREY = "#2e3a38";
 
 export function createSankey(
@@ -157,20 +152,12 @@ export function createSankey(
     const labelFloor =
       layout.maxCol > 48 ? model.maxLinkValue * 0.08 : 0;
 
-    // Layout values must add up: node height = max(sum in, sum out) of link
-    // visuals. Independent sqrt(node.count) leaves empty gaps in the bar.
-    const outVis = new Map<string, number>();
-    const inVis = new Map<string, number>();
-    for (const link of model.links) {
-      const w = visualWeight(link.value);
-      outVis.set(link.source, (outVis.get(link.source) || 0) + w);
-      inVis.set(link.target, (inVis.get(link.target) || 0) + w);
-    }
-
+    // Raw counts only — non-linear weights (sqrt) break conservation, so
+    // sum(out) ≠ sum(in) and flows leave empty grey in the node bar.
     const nodes = model.nodes.map((node) => ({
       name: node.id,
       depth: node.depth,
-      value: Math.max(inVis.get(node.id) || 0, outVis.get(node.id) || 0),
+      value: Math.max(1, node.count),
       // No border — stroke sits outside the fill and leaves a gap before links.
       itemStyle: {
         color: NODE_GREY,
@@ -189,7 +176,7 @@ export function createSankey(
     const links = model.links.map((link) => ({
       source: link.source,
       target: link.target,
-      value: visualWeight(link.value),
+      value: Math.max(1, link.value),
       lineStyle: {
         color: countToAccent(link.value, model.maxLinkValue),
         opacity: 0.72,

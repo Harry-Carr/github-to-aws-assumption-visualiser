@@ -133,7 +133,7 @@ app.innerHTML = `
         <input
           id="orgFilter"
           type="search"
-          placeholder="savings* or *corp"
+          placeholder="platform* or *corp"
           spellcheck="false"
           autocomplete="off"
         />
@@ -143,7 +143,7 @@ app.innerHTML = `
         <input
           id="repoFilter"
           type="search"
-          placeholder="*api or payments*"
+          placeholder="*api or security*"
           spellcheck="false"
           autocomplete="off"
         />

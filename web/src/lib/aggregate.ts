@@ -3,9 +3,9 @@ import type { ParsedAssume } from "./githubIdentity";
 export type MidStage = "branch" | "environment";
 
 export type FilterState = {
-  /** Org name glob (`savings*`, `*corp`). Empty = all. */
+  /** Org name glob (`platform*`, `*corp`). Empty = all. */
   org: string;
-  /** Repo short or `org/repo` glob (`*api`, `payments*`). Empty = all. */
+  /** Repo short or `org/repo` glob (`*api`, `security*`). Empty = all. */
   repo: string;
   role: string;
   minCount: number;

@@ -53,10 +53,10 @@ assert(resolveMid(both, "environment").label === "prod", "prefer env when select
 
 // Aggregation: org→repo link sums all leaf paths (12+1=13)
 assert(matchWildcard("", "x"), "empty pattern matches");
-assert(matchWildcard("savings*", "savings-prod"), "prefix *");
-assert(matchWildcard("*savings", "my-savings"), "suffix *");
-assert(matchWildcard("*save*", "my-save-now"), "contains *");
-assert(!matchWildcard("savings*", "prod-savings"), "prefix reject");
+assert(matchWildcard("platform*", "platform-prod"), "prefix *");
+assert(matchWildcard("*platform", "my-platform"), "suffix *");
+assert(matchWildcard("*plat*", "my-plat-now"), "contains *");
+assert(!matchWildcard("platform*", "prod-platform"), "prefix reject");
 assert(matchWildcard("Acme", "acme"), "exact case-insensitive");
 assert(!matchWildcard("Acme", "AcmeCorp"), "exact no partial without *");
 
@@ -145,27 +145,27 @@ assert(
 );
 
 const wildcardRows: ParsedAssume[] = [
-  row({ org: "savings-prod", repo: "ledger", repoFull: "savings-prod/ledger" }),
-  row({ org: "payments", repo: "savings-api", repoFull: "payments/savings-api" }),
+  row({ org: "platform-prod", repo: "ledger", repoFull: "platform-prod/ledger" }),
+  row({ org: "security", repo: "platform-api", repoFull: "security/platform-api" }),
   row({ org: "other", repo: "misc", repoFull: "other/misc" }),
 ];
-const byOrg = buildSankey(wildcardRows, { ...filters, org: "savings*" });
+const byOrg = buildSankey(wildcardRows, { ...filters, org: "platform*" });
 assert(
-  byOrg.nodes.some((n) => n.id === "org:savings-prod"),
-  "org savings* keeps savings-prod",
+  byOrg.nodes.some((n) => n.id === "org:platform-prod"),
+  "org platform* keeps platform-prod",
 );
 assert(
-  !byOrg.nodes.some((n) => n.id === "org:payments"),
-  "org savings* drops payments",
+  !byOrg.nodes.some((n) => n.id === "org:security"),
+  "org platform* drops security",
 );
-const byRepo = buildSankey(wildcardRows, { ...filters, repo: "*savings*" });
+const byRepo = buildSankey(wildcardRows, { ...filters, repo: "*platform*" });
 assert(
-  byRepo.nodes.some((n) => n.id === "repo:payments/savings-api"),
-  "repo *savings* keeps savings-api",
+  byRepo.nodes.some((n) => n.id === "repo:security/platform-api"),
+  "repo *platform* keeps platform-api",
 );
 assert(
   !byRepo.nodes.some((n) => n.id === "repo:other/misc"),
-  "repo *savings* drops misc",
+  "repo *platform* drops misc",
 );
 
 console.log("aggregate resolveMid + selection tests ok");
