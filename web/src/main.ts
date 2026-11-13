@@ -610,9 +610,6 @@ function onSankeySelect(
   activeDetail = detail;
   renderDetail(detail);
   renderAssumesTable();
-  if (detail) {
-    tablePanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }
 }
 
 function clearSankeySelection() {

@@ -46,7 +46,6 @@ export function visualWeight(count: number): number {
 }
 
 const NODE_GREY = "#2e3a38";
-const NODE_BORDER = "#2a9d90";
 
 export function createSankey(
   el: HTMLElement,
@@ -158,14 +157,24 @@ export function createSankey(
     const labelFloor =
       layout.maxCol > 48 ? model.maxLinkValue * 0.08 : 0;
 
+    // Layout values must add up: node height = max(sum in, sum out) of link
+    // visuals. Independent sqrt(node.count) leaves empty gaps in the bar.
+    const outVis = new Map<string, number>();
+    const inVis = new Map<string, number>();
+    for (const link of model.links) {
+      const w = visualWeight(link.value);
+      outVis.set(link.source, (outVis.get(link.source) || 0) + w);
+      inVis.set(link.target, (inVis.get(link.target) || 0) + w);
+    }
+
     const nodes = model.nodes.map((node) => ({
       name: node.id,
       depth: node.depth,
-      value: visualWeight(node.count),
+      value: Math.max(inVis.get(node.id) || 0, outVis.get(node.id) || 0),
+      // No border — stroke sits outside the fill and leaves a gap before links.
       itemStyle: {
         color: NODE_GREY,
-        borderColor: NODE_BORDER,
-        borderWidth: 1,
+        borderWidth: 0,
       },
       label: {
         show: node.count >= labelFloor || spacing >= 1.5,
@@ -249,8 +258,8 @@ export function createSankey(
             type: "sankey",
             emphasis: { focus: "adjacency" },
             nodeAlign: "justify",
-            left: layout.padX,
-            right: layout.padX,
+            left: layout.padLeft,
+            right: layout.padRight,
             top: 16,
             bottom: 16,
             nodeGap: layout.nodeGap,
@@ -266,7 +275,10 @@ export function createSankey(
               fontSize: layout.labelSize,
               fontWeight: 500,
               color: "#f4f4f5",
-              distance: 4,
+              distance: 6,
+              overflow: "truncate",
+              width: Math.max(64, layout.padRight - 16),
+              ellipsis: "…",
             },
           },
         ],
@@ -297,7 +309,8 @@ function layoutMetrics(
   labelSize: number;
   height: number;
   width: number;
-  padX: number;
+  padLeft: number;
+  padRight: number;
 } {
   const byDepth = [0, 0, 0, 0];
   for (const node of model.nodes) {
@@ -316,16 +329,37 @@ function layoutMetrics(
     24_000,
     Math.max(360, Math.round(maxCol * slot + 64)),
   );
-  // Width tracks height so tall graphs stay ~landscape / square, not a thin strip.
-  // Extra bump from spacing keeps columns from crowding when scroll-expanding.
+  // Right gutter sized for longest role/repo label (labels sit to the right).
+  const maxNameLen = Math.max(
+    8,
+    ...model.nodes.map((n) => n.name.length),
+  );
+  const padRight = Math.min(
+    420,
+    Math.max(140, Math.round(maxNameLen * labelSize * 0.62 + 24)),
+  );
+  const padLeft = 20;
+  // Width tracks height so tall graphs stay proportionate; include label gutter
+  // so column area is not stolen by padRight.
   const width = Math.min(
     14_000,
-    Math.max(720, Math.round(height * 0.92 + spacing * 120)),
+    Math.max(
+      720,
+      Math.round(height * 0.92 + spacing * 120) + padLeft + padRight,
+    ),
   );
   const nodeWidth =
     width > 2200 ? 22 : width > 1400 ? 18 : maxCol > 40 ? 10 : 14;
-  const padX = width > 1800 ? 48 : 24;
-  return { maxCol, nodeGap, nodeWidth, labelSize, height, width, padX };
+  return {
+    maxCol,
+    nodeGap,
+    nodeWidth,
+    labelSize,
+    height,
+    width,
+    padLeft,
+    padRight,
+  };
 }
 
 function assumesEmptyMessage(model: SankeyModel): string {
