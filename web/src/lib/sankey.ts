@@ -83,10 +83,17 @@ export function createSankey(
   const render = (model: SankeyModel) => {
     lastModel = model;
     const n = model.nodes.length;
-    // Fill parent viewport; don't force document height
+    const canvas = el.parentElement;
+    const layout = layoutMetrics(model);
+
+    // Tall canvas when a column is dense — viewport pans/zooms over it.
     el.style.width = "100%";
-    el.style.height = "100%";
-    chart.resize();
+    el.style.height = `${layout.height}px`;
+    if (canvas) {
+      canvas.style.width = "100%";
+      canvas.style.height = `${layout.height}px`;
+    }
+    chart.resize({ width: el.clientWidth || el.offsetWidth, height: layout.height });
 
     if (n === 0 || model.links.length === 0) {
       chart.clear();
@@ -109,6 +116,8 @@ export function createSankey(
 
     const idToDepth = new Map(model.nodes.map((node) => [node.id, node.depth]));
     const idToCount = new Map(model.nodes.map((node) => [node.id, node.count]));
+    // Hide the noisiest labels when a column is packed; tooltip still has names.
+    const labelFloor = layout.maxCol > 48 ? model.maxLinkValue * 0.08 : 0;
 
     const nodes = model.nodes.map((node) => ({
       name: node.id,
@@ -120,9 +129,10 @@ export function createSankey(
         borderWidth: 1,
       },
       label: {
+        show: node.count >= labelFloor,
         color: "#f4f4f5",
         fontFamily: "DM Sans, sans-serif",
-        fontSize: 12,
+        fontSize: layout.labelSize,
         fontWeight: 500,
         formatter: () => node.name,
       },
@@ -196,16 +206,17 @@ export function createSankey(
             type: "sankey",
             emphasis: { focus: "adjacency" },
             nodeAlign: "justify",
-            nodeGap: 14,
-            nodeWidth: 14,
-            layoutIterations: 64,
+            nodeGap: layout.nodeGap,
+            nodeWidth: layout.nodeWidth,
+            layoutIterations: layout.maxCol > 40 ? 32 : 64,
+            draggable: false,
             data: nodes,
             links,
             lineStyle: { curveness: 0.5 },
             label: {
               position: "right",
               fontFamily: "DM Sans, sans-serif",
-              fontSize: 12,
+              fontSize: layout.labelSize,
               fontWeight: 500,
               color: "#f4f4f5",
               distance: 4,
@@ -227,6 +238,28 @@ export function createSankey(
       chart.dispose();
     },
   };
+}
+
+function layoutMetrics(model: SankeyModel): {
+  maxCol: number;
+  nodeGap: number;
+  nodeWidth: number;
+  labelSize: number;
+  height: number;
+} {
+  const byDepth = [0, 0, 0, 0];
+  for (const node of model.nodes) {
+    if (node.depth >= 0 && node.depth < byDepth.length) {
+      byDepth[node.depth]! += 1;
+    }
+  }
+  const maxCol = Math.max(1, ...byDepth);
+  const nodeGap = maxCol > 60 ? 2 : maxCol > 40 ? 4 : maxCol > 24 ? 8 : 14;
+  const nodeWidth = maxCol > 40 ? 10 : 14;
+  const labelSize = maxCol > 48 ? 9 : maxCol > 28 ? 10 : 12;
+  // Enough vertical room for the densest column so links stay attached.
+  const height = Math.min(14_000, Math.max(360, maxCol * (10 + nodeGap) + 64));
+  return { maxCol, nodeGap, nodeWidth, labelSize, height };
 }
 
 function assumesEmptyMessage(model: SankeyModel): string {

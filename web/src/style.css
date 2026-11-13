@@ -465,6 +465,14 @@ button:disabled {
   color: var(--muted);
 }
 
+.sankey-truncation {
+  flex: 1 1 100%;
+  margin: 0.15rem 0 0;
+  font-size: 0.75rem;
+  color: var(--warning, #d29922);
+  line-height: 1.4;
+}
+
 .sankey-viewport {
   position: relative;
   width: 100%;

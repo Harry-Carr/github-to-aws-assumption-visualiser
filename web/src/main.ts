@@ -422,11 +422,46 @@ function ensureChart() {
     const vp = document.querySelector<HTMLElement>("#sankey-viewport")!;
     const canvas = document.querySelector<HTMLElement>("#sankey-canvas")!;
     viewport = attachViewport(vp, canvas, {
+      minScale: 0.15,
+      maxScale: 4,
       onChange: (scale) => {
         zoomLabel.textContent = `${Math.round(scale * 100)}%`;
       },
     });
   }
+}
+
+function setTruncationNote(
+  truncation:
+    | {
+        midsCollapsed: number;
+        rolesCollapsed: number;
+        reposCollapsed: number;
+      }
+    | undefined,
+) {
+  let note = document.querySelector<HTMLElement>("#sankey-truncation");
+  if (!truncation) {
+    note?.remove();
+    return;
+  }
+  if (!note) {
+    note = document.createElement("p");
+    note.id = "sankey-truncation";
+    note.className = "sankey-truncation";
+    sankeyToolbar.appendChild(note);
+  }
+  const bits: string[] = [];
+  if (truncation.reposCollapsed) {
+    bits.push(`${truncation.reposCollapsed} repos → other`);
+  }
+  if (truncation.midsCollapsed) {
+    bits.push(`${truncation.midsCollapsed} branch/env → other`);
+  }
+  if (truncation.rolesCollapsed) {
+    bits.push(`${truncation.rolesCollapsed} roles → other`);
+  }
+  note.textContent = `Large graph capped for layout (${bits.join("; ")}). Raise min path count or filter to focus. Zoom out / pan to explore.`;
 }
 
 function renderDetail(detail: PathDetail | null) {
@@ -476,7 +511,17 @@ function renderDetail(detail: PathDetail | null) {
   `;
 }
 
-function renderAll() {
+type RenderOpts = {
+  /** While scanning: keep viewport, do not wipe detail selection. */
+  incremental?: boolean;
+};
+
+let liveRenderTimer: number | null = null;
+let liveRenderPending = false;
+let revealedLiveResults = false;
+
+function renderAll(opts: RenderOpts = {}) {
+  const incremental = Boolean(opts.incremental);
   const filters = readFilters();
   const midLabel = filters.midStage === "branch" ? "Branch" : "Environment";
   midColHeader.textContent = midLabel;
@@ -485,6 +530,7 @@ function renderAll() {
   if (!assumes.length) {
     setResultsChrome(false);
     tablePanel.hidden = true;
+    setTruncationNote(undefined);
     if (sankey) {
       sankey.render({ nodes: [], links: [], paths: new Map(), maxLinkValue: 1 });
     }
@@ -492,14 +538,22 @@ function renderAll() {
     return;
   }
 
+  const firstReveal = !revealedLiveResults;
   setResultsChrome(true);
   ensureChart();
   tablePanel.hidden = false;
   const model = buildSankey(assumes, filters);
   const tableRows = buildTableRows(assumes, filters);
   sankey!.render(model);
-  renderDetail(null);
-  viewport?.reset();
+  setTruncationNote(model.truncation);
+  if (!incremental) {
+    renderDetail(null);
+    viewport?.reset();
+  } else if (firstReveal) {
+    renderDetail(null);
+    viewport?.reset();
+  }
+  revealedLiveResults = true;
 
   tableBody.innerHTML = tableRows.length
     ? tableRows
@@ -515,6 +569,29 @@ function renderAll() {
         )
         .join("")
     : `<tr><td colspan="5" class="empty">No rows match current filters.</td></tr>`;
+}
+
+/** Throttle live Sankey updates so ECharts is not rebuilt every page. */
+function scheduleLiveRender() {
+  liveRenderPending = true;
+  if (liveRenderTimer != null) return;
+  liveRenderTimer = window.setTimeout(() => {
+    liveRenderTimer = null;
+    if (!liveRenderPending) return;
+    liveRenderPending = false;
+    fillFilterOptions();
+    renderAll({ incremental: true });
+  }, 400);
+}
+
+function flushLiveRender() {
+  if (liveRenderTimer != null) {
+    clearTimeout(liveRenderTimer);
+    liveRenderTimer = null;
+  }
+  liveRenderPending = false;
+  fillFilterOptions();
+  renderAll({ incremental: true });
 }
 
 // Initial empty chart
@@ -559,6 +636,9 @@ document.querySelector("#scan-form")!.addEventListener("submit", async (ev) => {
   abortCtrl = new AbortController();
   scanBtn.disabled = true;
   cancelBtn.disabled = false;
+  revealedLiveResults = false;
+  assumes = [];
+  renderAll();
   setProgress(`Starting ${regions.length} region(s)…`);
 
   try {
@@ -575,31 +655,46 @@ document.querySelector("#scan-form")!.addEventListener("submit", async (ev) => {
           `${p.status}${scope} · pages=${p.pages} raw=${p.rawEvents} github=${p.githubEvents}`,
         );
       },
+      onBatch: (_batch, allSoFar) => {
+        assumes = allSoFar as ParsedAssume[];
+        const firstData = !revealedLiveResults && assumes.length > 0;
+        if (firstData) {
+          // Immediate first paint so the Flow appears as soon as we have rows.
+          flushLiveRender();
+          setCredsCollapsed(true);
+          document
+            .querySelector("#results")
+            ?.scrollIntoView({ behavior: "smooth", block: "start" });
+        } else {
+          scheduleLiveRender();
+        }
+      },
     });
     didScan = true;
-    fillFilterOptions();
-    renderAll();
+    flushLiveRender();
     setProgress(
       assumes.length
         ? `Found ${assumes.length} GitHub OIDC assume event(s) across ${regions.length} region(s).`
         : "Scan finished — no GitHub OIDC assumes in this window/regions.",
       assumes.length ? "ok" : "",
     );
-    if (assumes.length) {
-      setCredsCollapsed(true);
-      document
-        .querySelector("#results")
-        ?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
-      setProgress("Cancelled.", "");
+      didScan = true;
+      flushLiveRender();
+      setProgress(
+        assumes.length
+          ? `Cancelled — showing ${assumes.length} assume(s) collected so far.`
+          : "Cancelled.",
+        assumes.length ? "ok" : "",
+      );
     } else {
       const msg = err instanceof Error ? err.message : String(err);
       const hint = /AccessDenied|not authorized|Unauthorized/i.test(msg)
         ? " — grant cloudtrail:LookupEvents on this identity."
         : "";
       setProgress(`Error: ${msg}${hint}`, "error");
+      if (assumes.length) flushLiveRender();
     }
   } finally {
     scanBtn.disabled = false;

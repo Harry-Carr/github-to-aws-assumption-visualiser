@@ -55,13 +55,29 @@ export type PathDetail = {
   scope: string;
 };
 
+export type SankeyTruncation = {
+  /** Mid (branch/env) values rolled into per-repo "other" */
+  midsCollapsed: number;
+  /** Distinct roles rolled into "other roles" */
+  rolesCollapsed: number;
+  /** Distinct repos rolled into "other repos" */
+  reposCollapsed: number;
+};
+
 export type SankeyModel = {
   nodes: SankeyNode[];
   links: SankeyLink[];
   /** Finest grain paths (org/repo/mid/role) for click detail */
   paths: Map<string, PathDetail>;
   maxLinkValue: number;
+  /** Present when chart cardinality was capped for layout. */
+  truncation?: SankeyTruncation;
 };
+
+/** Soft caps so ECharts sankey can layout inside a scrollable canvas. */
+export const SANKEY_MAX_MIDS_PER_REPO = 12;
+export const SANKEY_MAX_ROLES = 36;
+export const SANKEY_MAX_REPOS = 40;
 
 /**
  * Prefer the selected mid stage; if that claim is missing from the OIDC sub,
@@ -160,6 +176,8 @@ export function buildSankey(
     if (path.count < filters.minCount) paths.delete(key);
   }
 
+  const { paths: cappedPaths, truncation } = collapseHighCardinality(paths);
+
   const linkMap = new Map<string, number>();
   const nodeCount = new Map<string, { name: string; depth: number; count: number }>();
 
@@ -174,7 +192,7 @@ export function buildSankey(
     linkMap.set(k, (linkMap.get(k) || 0) + n);
   };
 
-  for (const path of paths.values()) {
+  for (const path of cappedPaths.values()) {
     // Columns: org → repo → branch|env → role
     const orgId = `org:${path.org}`;
     const repoId = `repo:${path.repoFull}`;
@@ -208,7 +226,175 @@ export function buildSankey(
     if (value > maxLinkValue) maxLinkValue = value;
   }
 
-  return { nodes, links, paths, maxLinkValue };
+  return {
+    nodes,
+    links,
+    paths: cappedPaths,
+    maxLinkValue,
+    truncation:
+      truncation.midsCollapsed ||
+      truncation.rolesCollapsed ||
+      truncation.reposCollapsed
+        ? truncation
+        : undefined,
+  };
+}
+
+/**
+ * Cap chart cardinality: rare mids/repos/roles roll into "other" buckets so
+ * ECharts sankey can layout. Detail/table still reflect collapsed labels.
+ */
+export function collapseHighCardinality(
+  paths: Map<string, PathDetail>,
+  opts?: {
+    maxMidsPerRepo?: number;
+    maxRoles?: number;
+    maxRepos?: number;
+  },
+): { paths: Map<string, PathDetail>; truncation: SankeyTruncation } {
+  const maxMidsPerRepo = opts?.maxMidsPerRepo ?? SANKEY_MAX_MIDS_PER_REPO;
+  const maxRoles = opts?.maxRoles ?? SANKEY_MAX_ROLES;
+  const maxRepos = opts?.maxRepos ?? SANKEY_MAX_REPOS;
+
+  const truncation: SankeyTruncation = {
+    midsCollapsed: 0,
+    rolesCollapsed: 0,
+    reposCollapsed: 0,
+  };
+
+  if (!paths.size) return { paths, truncation };
+
+  // --- Repos: keep top N by total assumes ---
+  const repoTotals = new Map<string, number>();
+  for (const p of paths.values()) {
+    repoTotals.set(p.repoFull, (repoTotals.get(p.repoFull) || 0) + p.count);
+  }
+  const keepRepos = new Set(
+    [...repoTotals.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, maxRepos)
+      .map(([repo]) => repo),
+  );
+  const droppedRepos = [...repoTotals.keys()].filter((r) => !keepRepos.has(r));
+  truncation.reposCollapsed = droppedRepos.length;
+
+  // --- Roles: keep top N by total assumes ---
+  const roleTotals = new Map<string, number>();
+  for (const p of paths.values()) {
+    roleTotals.set(p.roleName, (roleTotals.get(p.roleName) || 0) + p.count);
+  }
+  const keepRoles = new Set(
+    [...roleTotals.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, maxRoles)
+      .map(([role]) => role),
+  );
+  const droppedRoles = [...roleTotals.keys()].filter((r) => !keepRoles.has(r));
+  truncation.rolesCollapsed = droppedRoles.length;
+
+  // --- Mids: per-repo keep top N ---
+  const midTotalsByRepo = new Map<string, Map<string, number>>();
+  for (const p of paths.values()) {
+    const repoKey = keepRepos.has(p.repoFull) ? p.repoFull : "__other_repos__";
+    let mids = midTotalsByRepo.get(repoKey);
+    if (!mids) {
+      mids = new Map();
+      midTotalsByRepo.set(repoKey, mids);
+    }
+    const midKey = `${p.midKind}:${p.midLabel}`;
+    mids.set(midKey, (mids.get(midKey) || 0) + p.count);
+  }
+  const keepMidsByRepo = new Map<string, Set<string>>();
+  for (const [repo, mids] of midTotalsByRepo) {
+    const keep = new Set(
+      [...mids.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, maxMidsPerRepo)
+        .map(([k]) => k),
+    );
+    keepMidsByRepo.set(repo, keep);
+    truncation.midsCollapsed += Math.max(0, mids.size - keep.size);
+  }
+
+  const otherOrgLabel = uniqueOrJoin(
+    [...paths.values()]
+      .filter((x) => !keepRepos.has(x.repoFull))
+      .map((x) => x.org),
+  );
+  const otherRepoFull =
+    droppedRepos.length > 0
+      ? `__other__/${droppedRepos.length} more repos`
+      : "";
+  const otherRoleLabel =
+    droppedRoles.length > 0 ? `other roles (+${droppedRoles.length})` : "";
+
+  const out = new Map<string, PathDetail>();
+
+  for (const p of paths.values()) {
+    let org = p.org;
+    let repoFull = p.repoFull;
+    let midLabel = p.midLabel;
+    const midKind = p.midKind;
+    let roleName = p.roleName;
+    let roleArn = p.roleArn;
+
+    const repoBucket = keepRepos.has(p.repoFull)
+      ? p.repoFull
+      : "__other_repos__";
+
+    if (!keepRepos.has(p.repoFull)) {
+      org = otherOrgLabel;
+      repoFull = otherRepoFull;
+    }
+
+    const midKey = `${p.midKind}:${p.midLabel}`;
+    const keepMids = keepMidsByRepo.get(repoBucket) ?? new Set<string>();
+    if (!keepMids.has(midKey)) {
+      const dropped =
+        (midTotalsByRepo.get(repoBucket)?.size || 0) - keepMids.size;
+      midLabel = `other (+${Math.max(1, dropped)})`;
+    }
+
+    if (!keepRoles.has(p.roleName)) {
+      roleName = otherRoleLabel;
+      roleArn = "—";
+    }
+
+    const key = pathKey(org, repoFull, midLabel, roleName, midKind);
+    let agg = out.get(key);
+    if (!agg) {
+      agg = {
+        org,
+        repoFull,
+        midLabel,
+        midKind,
+        roleName,
+        roleArn,
+        count: 0,
+        workflows: new Map(),
+        subjects: [],
+        eventTimes: [],
+        pathCount: 0,
+        scope: "path",
+      };
+      out.set(key, agg);
+    }
+    agg.count += p.count;
+    agg.pathCount += p.pathCount;
+    for (const [wf, n] of p.workflows) {
+      agg.workflows.set(wf, (agg.workflows.get(wf) || 0) + n);
+    }
+    for (const s of p.subjects) {
+      if (agg.subjects.length < 20 && !agg.subjects.includes(s)) {
+        agg.subjects.push(s);
+      }
+    }
+    for (const t of p.eventTimes) {
+      if (agg.eventTimes.length < 20) agg.eventTimes.push(t);
+    }
+  }
+
+  return { paths: out, truncation };
 }
 
 export type TableRow = {

@@ -95,4 +95,33 @@ const leaf = detailForSelection(
 );
 assert(leaf?.count === 12, `leaf link should be 12, got ${leaf?.count}`);
 
+// High-cardinality mid collapse: keep top mids, roll rest into other
+const busyFilters: FilterState = { ...filters, midStage: "branch", minCount: 1 };
+const busyRows: ParsedAssume[] = [];
+for (let i = 0; i < 20; i++) {
+  busyRows.push(
+    ...Array.from({ length: 20 - i }, () =>
+      row({
+        org: "o",
+        repo: "demo",
+        repoFull: "o/demo",
+        branch: `tag:v${i}`,
+        roleName: "deploy",
+        roleArn: "arn:aws:iam::1:role/deploy",
+      }),
+    ),
+  );
+}
+const busy = buildSankey(busyRows, busyFilters);
+assert(busy.truncation?.midsCollapsed, "should collapse excess mids");
+const midNodes = busy.nodes.filter((n) => n.depth === 2);
+assert(
+  midNodes.length <= 13,
+  `mid column capped, got ${midNodes.length}`,
+);
+assert(
+  midNodes.some((n) => n.name.startsWith("other")),
+  "other mid bucket present",
+);
+
 console.log("aggregate resolveMid + selection tests ok");
