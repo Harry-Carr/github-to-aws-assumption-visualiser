@@ -48,6 +48,11 @@ export type ScanOptions = {
   regions: string[];
   signal?: AbortSignal;
   onProgress?: (p: ScanProgress) => void;
+  /**
+   * Called after each LookupEvents page that yields GitHub OIDC assumes.
+   * `batch` = new rows from that page; `allSoFar` = cumulative across regions.
+   */
+  onBatch?: (batch: ParsedAssume[], allSoFar: readonly ParsedAssume[]) => void;
   /** Max attempts per LookupEvents page (default 8). */
   maxRetries?: number;
   /** Base backoff ms before first retry (default 750). */
@@ -62,6 +67,8 @@ const DEFAULT_MAX_RETRIES = 8;
 const DEFAULT_RETRY_BASE_MS = 750;
 const DEFAULT_RETRY_MAX_MS = 20_000;
 const DEFAULT_PAGE_DELAY_MS = 350;
+/** LookupEvents MaxResults ceiling (AWS: 1–50). */
+const LOOKUP_MAX_RESULTS = 50;
 
 function createClient(creds: AwsCreds, region: string): CloudTrailClient {
   return new CloudTrailClient({
@@ -202,11 +209,12 @@ async function scanOneRegion(
   end: Date,
   options: ScanOptions,
   totals: { pages: number; rawEvents: number; githubEvents: number },
+  allResults: ParsedAssume[],
   regionIndex: number,
   regionTotal: number,
-): Promise<ParsedAssume[]> {
+): Promise<number> {
   const client = createClient(creds, region);
-  const results: ParsedAssume[] = [];
+  let regionGithub = 0;
   let nextToken: string | undefined;
   const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const retryBaseMs = options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS;
@@ -217,7 +225,7 @@ async function scanOneRegion(
     options.onProgress?.({
       pages: totals.pages,
       rawEvents: totals.rawEvents,
-      githubEvents: totals.githubEvents + results.length,
+      githubEvents: totals.githubEvents,
       status,
       region,
       regionIndex,
@@ -244,7 +252,7 @@ async function scanOneRegion(
           ],
           StartTime: start,
           EndTime: end,
-          MaxResults: 50,
+          MaxResults: LOOKUP_MAX_RESULTS,
           NextToken: nextToken,
         },
         {
@@ -263,6 +271,7 @@ async function scanOneRegion(
       totals.pages += 1;
       const events = response.Events || [];
       totals.rawEvents += events.length;
+      const pageBatch: ParsedAssume[] = [];
 
       for (const item of events) {
         const cloudEvent = parseCloudTrailEvent(item);
@@ -271,14 +280,24 @@ async function scanOneRegion(
           cloudEvent.eventTime = item.EventTime.toISOString();
         }
         const parsed = parseAssumeEvent(cloudEvent);
-        if (parsed) results.push(parsed);
+        if (parsed) {
+          pageBatch.push(parsed);
+          allResults.push(parsed);
+        }
+      }
+
+      regionGithub += pageBatch.length;
+      totals.githubEvents = allResults.length;
+
+      if (pageBatch.length) {
+        options.onBatch?.(pageBatch, allResults);
       }
 
       nextToken = response.NextToken;
       report(
         nextToken
           ? `${region}: page ${totals.pages} (${totals.rawEvents} events)…`
-          : `${region}: done — ${results.length} GitHub OIDC assume(s)`,
+          : `${region}: done — ${regionGithub} GitHub OIDC assume(s)`,
       );
 
       // Pace successful pages; LookupEvents throttles easily across regions.
@@ -290,8 +309,7 @@ async function scanOneRegion(
     client.destroy();
   }
 
-  totals.githubEvents += results.length;
-  return results;
+  return regionGithub;
 }
 
 /**
@@ -333,17 +351,17 @@ export async function scanGitHubAssumes(
       throw new DOMException("Scan cancelled", "AbortError");
     }
     const region = regions[i]!;
-    const rows = await scanOneRegion(
+    await scanOneRegion(
       creds,
       region,
       start,
       end,
       options,
       totals,
+      results,
       i + 1,
       regions.length,
     );
-    results.push(...rows);
 
     // Brief pause between regions so the next region's first page is less likely to 400.
     if (i < regions.length - 1 && pageDelayMs > 0) {
