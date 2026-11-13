@@ -8,13 +8,19 @@ import {
 import {
   buildSankey,
   buildTableRows,
+  detailForSelection,
+  matchingPaths,
+  tableRowsFromPaths,
   toCsv,
-  uniqueOrgs,
   uniqueRoles,
   type FilterState,
   type PathDetail,
+  type TableRow,
 } from "./lib/aggregate";
-import { createSankey } from "./lib/sankey";
+import {
+  createSankey,
+  type SankeySelection,
+} from "./lib/sankey";
 import { attachViewport, type ViewportHandle } from "./lib/viewport";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -124,7 +130,23 @@ app.innerHTML = `
       </label>
       <label>
         Org filter
-        <select id="orgFilter"><option value="">All</option></select>
+        <input
+          id="orgFilter"
+          type="search"
+          placeholder="savings* or *corp"
+          spellcheck="false"
+          autocomplete="off"
+        />
+      </label>
+      <label>
+        Repo filter
+        <input
+          id="repoFilter"
+          type="search"
+          placeholder="*api or payments*"
+          spellcheck="false"
+          autocomplete="off"
+        />
       </label>
       <label>
         Role filter
@@ -135,10 +157,6 @@ app.innerHTML = `
         <input id="minCount" type="number" min="1" value="1" />
       </label>
       <label class="check">
-        <input id="hideUnknown" type="checkbox" />
-        Hide unknown workflow
-      </label>
-      <label class="check">
         <input id="hideUnknownMid" type="checkbox" />
         Hide unknown branch/env
       </label>
@@ -147,11 +165,11 @@ app.innerHTML = `
 
     <div class="sankey-shell">
       <div class="sankey-toolbar" id="sankey-toolbar" hidden>
-        <button type="button" class="icon-btn secondary" id="zoom-out" aria-label="Zoom out" title="Zoom out">−</button>
-        <button type="button" class="icon-btn secondary" id="zoom-in" aria-label="Zoom in" title="Zoom in">+</button>
+        <button type="button" class="icon-btn secondary" id="zoom-out" aria-label="Zoom out" title="Zoom out (or Ctrl+scroll)">−</button>
+        <button type="button" class="icon-btn secondary" id="zoom-in" aria-label="Zoom in" title="Zoom in (or Ctrl+scroll)">+</button>
         <button type="button" class="secondary" id="zoom-reset" aria-label="Reset view">Reset view</button>
-        <span class="hint" id="zoom-label">100%</span>
-        <span class="hint">Scroll = zoom · drag = pan</span>
+        <span class="hint" id="view-label">Spacing 1.0× · Zoom 100%</span>
+        <span class="hint">Scroll = expand flows · Ctrl+scroll = zoom · drag = pan</span>
       </div>
       <div class="sankey-viewport" id="sankey-viewport">
         <div class="flow-empty" id="flow-empty">
@@ -172,18 +190,21 @@ app.innerHTML = `
   </section>
 
   <section class="panel" id="table-panel" hidden>
-    <div class="panel-head">
-      <h2 id="table-title">Assumes by role × repo × branch</h2>
+    <div class="panel-head table-panel-head">
+      <div class="table-heading">
+        <h2 id="table-title">Assumes by role × repo × branch</h2>
+        <p class="table-sub" id="table-sub"></p>
+      </div>
+      <button type="button" class="secondary" id="table-clear" hidden>
+        Show all flows
+      </button>
     </div>
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
             <th>Count</th>
-            <th>Role</th>
-            <th>Repo</th>
-            <th id="mid-col-header">Branch</th>
-            <th>Workflows</th>
+            <th>Flow</th>
           </tr>
         </thead>
         <tbody id="table-body"></tbody>
@@ -205,12 +226,43 @@ const scanBtn = document.querySelector<HTMLButtonElement>("#scan-btn")!;
 const cancelBtn = document.querySelector<HTMLButtonElement>("#cancel-btn")!;
 const tablePanel = document.querySelector<HTMLElement>("#table-panel")!;
 const tableTitle = document.querySelector<HTMLElement>("#table-title")!;
+const tableSub = document.querySelector<HTMLElement>("#table-sub")!;
+const tableClear = document.querySelector<HTMLButtonElement>("#table-clear")!;
 const detailEl = document.querySelector<HTMLElement>("#detail")!;
 const tableBody = document.querySelector<HTMLElement>("#table-body")!;
-const orgFilter = document.querySelector<HTMLSelectElement>("#orgFilter")!;
+const orgFilter = document.querySelector<HTMLInputElement>("#orgFilter")!;
+const repoFilter = document.querySelector<HTMLInputElement>("#repoFilter")!;
 const roleFilter = document.querySelector<HTMLSelectElement>("#roleFilter")!;
-const midColHeader = document.querySelector<HTMLElement>("#mid-col-header")!;
-const zoomLabel = document.querySelector<HTMLElement>("#zoom-label")!;
+const viewLabel = document.querySelector<HTMLElement>("#view-label")!;
+const FLOW_SPACING_MIN = 1;
+const FLOW_SPACING_MAX = 8;
+const FLOW_SPACING_STEP = 0.25;
+let flowSpacing = 1;
+let viewportZoom = 1;
+let lastSankeyModel: ReturnType<typeof buildSankey> | null = null;
+let activeSelection: SankeySelection | null = null;
+let activeDetail: PathDetail | null = null;
+
+function updateViewLabel() {
+  viewLabel.textContent = `Spacing ${flowSpacing.toFixed(1)}× · Zoom ${Math.round(viewportZoom * 100)}%`;
+}
+
+function setFlowSpacing(next: number, rerender = true) {
+  const clamped = Math.min(
+    FLOW_SPACING_MAX,
+    Math.max(FLOW_SPACING_MIN, Math.round(next / FLOW_SPACING_STEP) * FLOW_SPACING_STEP),
+  );
+  if (clamped === flowSpacing && rerender) {
+    updateViewLabel();
+    return false;
+  }
+  flowSpacing = clamped;
+  updateViewLabel();
+  if (rerender && lastSankeyModel && sankey) {
+    sankey.render(lastSankeyModel, { spacing: flowSpacing });
+  }
+  return true;
+}
 const credsPanel = document.querySelector<HTMLElement>("#creds-panel")!;
 const credsToggle = document.querySelector<HTMLButtonElement>("#creds-toggle")!;
 const resultsTools = document.querySelector<HTMLElement>("#results-tools")!;
@@ -362,14 +414,13 @@ function setProgress(msg: string, kind: "" | "error" | "ok" = "") {
 
 function readFilters(): FilterState {
   return {
-    org: orgFilter.value,
+    org: orgFilter.value.trim(),
+    repo: repoFilter.value.trim(),
     role: roleFilter.value,
     minCount: Math.max(
       1,
       Number(document.querySelector<HTMLInputElement>("#minCount")!.value) || 1,
     ),
-    hideUnknownWorkflow:
-      document.querySelector<HTMLInputElement>("#hideUnknown")!.checked,
     hideUnknownMid:
       document.querySelector<HTMLInputElement>("#hideUnknownMid")!.checked,
     midStage: document.querySelector<HTMLSelectElement>("#midStage")!
@@ -378,21 +429,13 @@ function readFilters(): FilterState {
 }
 
 function fillFilterOptions() {
-  const orgs = uniqueOrgs(assumes);
   const roles = uniqueRoles(assumes);
-  const keepOrg = orgFilter.value;
   const keepRole = roleFilter.value;
-  orgFilter.innerHTML =
-    `<option value="">All</option>` +
-    orgs
-      .map((o) => `<option value="${escapeAttr(o)}">${escapeHtml(o)}</option>`)
-      .join("");
   roleFilter.innerHTML =
     `<option value="">All</option>` +
     roles
       .map((r) => `<option value="${escapeAttr(r)}">${escapeHtml(r)}</option>`)
       .join("");
-  if (orgs.includes(keepOrg)) orgFilter.value = keepOrg;
   if (roles.includes(keepRole)) roleFilter.value = keepRole;
 }
 
@@ -416,7 +459,7 @@ function shortRepo(repoFull: string): string {
 function ensureChart() {
   if (!sankey) {
     const el = document.querySelector<HTMLElement>("#sankey")!;
-    sankey = createSankey(el, renderDetail);
+    sankey = createSankey(el, onSankeySelect);
   }
   if (!viewport) {
     const vp = document.querySelector<HTMLElement>("#sankey-viewport")!;
@@ -425,9 +468,15 @@ function ensureChart() {
       minScale: 0.15,
       maxScale: 4,
       onChange: (scale) => {
-        zoomLabel.textContent = `${Math.round(scale * 100)}%`;
+        viewportZoom = scale;
+        updateViewLabel();
+      },
+      onSpacingWheel: (direction) => {
+        // Scroll up → expand small flows; scroll down → compact
+        setFlowSpacing(flowSpacing + direction * FLOW_SPACING_STEP);
       },
     });
+    updateViewLabel();
   }
 }
 
@@ -461,7 +510,116 @@ function setTruncationNote(
   if (truncation.rolesCollapsed) {
     bits.push(`${truncation.rolesCollapsed} roles → other`);
   }
-  note.textContent = `Large graph capped for layout (${bits.join("; ")}). Raise min path count or filter to focus. Zoom out / pan to explore.`;
+  note.textContent = `Large graph capped for layout (${bits.join("; ")}). Scroll to expand small flows, or filter / raise min path count.`;
+}
+
+function selectionHeadline(detail: PathDetail): string {
+  if (detail.pathCount <= 1) {
+    return `${shortRepo(detail.repoFull)} → ${detail.midLabel} → ${detail.roleName}`;
+  }
+  // Multi-path: prefer the most specific single field that isn't aggregated
+  if (!detail.roleName.includes(",") && !detail.roleName.includes("+")) {
+    return `Role ${detail.roleName}`;
+  }
+  if (!detail.repoFull.includes(",") && !detail.repoFull.includes("+")) {
+    return `Repo ${detail.repoFull}`;
+  }
+  if (!detail.midLabel.includes(",") && !detail.midLabel.includes("+")) {
+    return `${detail.midKind === "branch" ? "Branch" : "Env"} ${detail.midLabel}`;
+  }
+  if (!detail.org.includes(",") && !detail.org.includes("+")) {
+    return `Org ${detail.org}`;
+  }
+  return `${detail.pathCount} paths in selection`;
+}
+
+function flowCell(row: TableRow, midKindLabel: string): string {
+  return `
+    <div class="flow-cell">
+      <span class="flow-path">
+        <code title="${escapeHtml(row.repoFull)}">${escapeHtml(row.repoFull)}</code>
+        <span class="flow-arrow" aria-hidden="true">→</span>
+        <code title="${escapeHtml(midKindLabel)}">${escapeHtml(row.mid)}</code>
+        <span class="flow-arrow" aria-hidden="true">→</span>
+        <code title="${escapeHtml(row.roleArn)}">${escapeHtml(row.roleName)}</code>
+      </span>
+    </div>`;
+}
+
+function renderAssumesTable() {
+  const filters = readFilters();
+  const midLabel = filters.midStage === "branch" ? "Branch" : "Environment";
+  let rows: TableRow[];
+
+  if (activeSelection && lastSankeyModel) {
+    const paths = matchingPaths(
+      lastSankeyModel,
+      activeSelection.kind,
+      activeSelection.sourceOrId,
+      activeSelection.target,
+    );
+    rows = tableRowsFromPaths(paths);
+    const detail =
+      activeDetail ??
+      detailForSelection(
+        lastSankeyModel,
+        activeSelection.kind,
+        activeSelection.sourceOrId,
+        activeSelection.target,
+      );
+    const total = rows.reduce((s, r) => s + r.count, 0);
+    tableTitle.textContent = detail
+      ? selectionHeadline(detail)
+      : "Selected flows";
+    tableSub.textContent =
+      rows.length === 0
+        ? "No leaf paths under this selection."
+        : `${total.toLocaleString()} assumes across ${rows.length} path${rows.length === 1 ? "" : "s"} · click empty chart area or Show all to reset`;
+    tableClear.hidden = false;
+  } else {
+    rows = buildTableRows(assumes, filters);
+    tableTitle.textContent = `Assumes by role × repo × ${midLabel.toLowerCase()}`;
+    tableSub.textContent = rows.length
+      ? `${rows.length} path${rows.length === 1 ? "" : "s"} · click a Sankey node or flow to focus`
+      : "";
+    tableClear.hidden = true;
+  }
+
+  tableBody.innerHTML = rows.length
+    ? rows
+        .map(
+          (r) => `
+      <tr>
+        <td class="count-cell">${r.count.toLocaleString()}</td>
+        <td>${flowCell(r, midLabel)}</td>
+      </tr>`,
+        )
+        .join("")
+    : `<tr><td colspan="2" class="empty">${
+        activeSelection
+          ? "No leaf paths under this selection."
+          : "No rows match current filters."
+      }</td></tr>`;
+}
+
+function onSankeySelect(
+  detail: PathDetail | null,
+  selection: SankeySelection | null,
+) {
+  activeSelection = detail && selection ? selection : null;
+  activeDetail = detail;
+  renderDetail(detail);
+  renderAssumesTable();
+  if (detail) {
+    tablePanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+}
+
+function clearSankeySelection() {
+  activeSelection = null;
+  activeDetail = null;
+  renderDetail(null);
+  renderAssumesTable();
 }
 
 function renderDetail(detail: PathDetail | null) {
@@ -475,10 +633,6 @@ function renderDetail(detail: PathDetail | null) {
   }
   const midTitle =
     detail.midKind === "branch" ? "Branch" : "Environment";
-  const workflows = [...detail.workflows.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([n, c]) => `<li><code>${escapeHtml(n)}</code> — ${c}</li>`)
-    .join("");
   const subjects = detail.subjects
     .map((s) => `<li><code>${escapeHtml(s)}</code></li>`)
     .join("");
@@ -488,7 +642,7 @@ function renderDetail(detail: PathDetail | null) {
     .join("");
   const title =
     detail.pathCount > 1
-      ? `${detail.org} · ${detail.pathCount} paths`
+      ? `${selectionHeadline(detail)} · ${detail.pathCount} paths`
       : `${detail.org} / ${shortRepo(detail.repoFull)}`;
 
   detailEl.innerHTML = `
@@ -502,8 +656,6 @@ function renderDetail(detail: PathDetail | null) {
       <dt>Role</dt><dd>${escapeHtml(detail.roleName)}</dd>
       <dt>Role ARN</dt><dd>${escapeHtml(detail.roleArn)}</dd>
     </dl>
-    <p class="section-label">Workflows</p>
-    <ul>${workflows || "<li class='empty'>none parsed</li>"}</ul>
     <p class="section-label">Subjects (sample)</p>
     <ul>${subjects || "<li class='empty'>none</li>"}</ul>
     <p class="section-label">Event times (sample)</p>
@@ -523,16 +675,19 @@ let revealedLiveResults = false;
 function renderAll(opts: RenderOpts = {}) {
   const incremental = Boolean(opts.incremental);
   const filters = readFilters();
-  const midLabel = filters.midStage === "branch" ? "Branch" : "Environment";
-  midColHeader.textContent = midLabel;
-  tableTitle.textContent = `Assumes by role × repo × ${midLabel.toLowerCase()}`;
 
   if (!assumes.length) {
     setResultsChrome(false);
     tablePanel.hidden = true;
     setTruncationNote(undefined);
+    lastSankeyModel = null;
+    activeSelection = null;
+    activeDetail = null;
     if (sankey) {
-      sankey.render({ nodes: [], links: [], paths: new Map(), maxLinkValue: 1 });
+      sankey.render(
+        { nodes: [], links: [], paths: new Map(), maxLinkValue: 1 },
+        { spacing: flowSpacing },
+      );
     }
     renderDetail(null);
     return;
@@ -543,32 +698,37 @@ function renderAll(opts: RenderOpts = {}) {
   ensureChart();
   tablePanel.hidden = false;
   const model = buildSankey(assumes, filters);
-  const tableRows = buildTableRows(assumes, filters);
-  sankey!.render(model);
+  lastSankeyModel = model;
+  if (!incremental) {
+    flowSpacing = FLOW_SPACING_MIN;
+    updateViewLabel();
+    activeSelection = null;
+    activeDetail = null;
+  }
+  sankey!.render(model, { spacing: flowSpacing });
   setTruncationNote(model.truncation);
   if (!incremental) {
     renderDetail(null);
     viewport?.reset();
   } else if (firstReveal) {
+    activeSelection = null;
+    activeDetail = null;
     renderDetail(null);
     viewport?.reset();
+  } else if (activeSelection) {
+    activeDetail = detailForSelection(
+      model,
+      activeSelection.kind,
+      activeSelection.sourceOrId,
+      activeSelection.target,
+    );
+    if (!activeDetail) {
+      activeSelection = null;
+    }
+    renderDetail(activeDetail);
   }
   revealedLiveResults = true;
-
-  tableBody.innerHTML = tableRows.length
-    ? tableRows
-        .map(
-          (r) => `
-      <tr>
-        <td>${r.count}</td>
-        <td><code>${escapeHtml(r.roleName)}</code></td>
-        <td><code>${escapeHtml(r.repoFull)}</code></td>
-        <td><code>${escapeHtml(r.mid)}</code></td>
-        <td>${escapeHtml(r.workflows)}</td>
-      </tr>`,
-        )
-        .join("")
-    : `<tr><td colspan="5" class="empty">No rows match current filters.</td></tr>`;
+  renderAssumesTable();
 }
 
 /** Throttle live Sankey updates so ECharts is not rebuilt every page. */
@@ -607,7 +767,12 @@ document.querySelector("#zoom-out")!.addEventListener("click", () => {
 });
 document.querySelector("#zoom-reset")!.addEventListener("click", () => {
   ensureChart();
+  setFlowSpacing(FLOW_SPACING_MIN, true);
   viewport?.reset();
+});
+
+tableClear.addEventListener("click", () => {
+  clearSankeySelection();
 });
 
 document.querySelector("#scan-form")!.addEventListener("submit", async (ev) => {
@@ -709,13 +874,22 @@ cancelBtn.addEventListener("click", () => {
 
 for (const id of [
   "midStage",
-  "orgFilter",
   "roleFilter",
   "minCount",
-  "hideUnknown",
   "hideUnknownMid",
 ]) {
   document.querySelector(`#${id}`)!.addEventListener("change", () => renderAll());
+}
+
+let filterInputTimer: number | null = null;
+for (const el of [orgFilter, repoFilter]) {
+  el.addEventListener("input", () => {
+    if (filterInputTimer != null) clearTimeout(filterInputTimer);
+    filterInputTimer = window.setTimeout(() => {
+      filterInputTimer = null;
+      renderAll();
+    }, 200);
+  });
 }
 
 exportCsvBtn.addEventListener("click", () => {

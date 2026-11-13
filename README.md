@@ -25,8 +25,8 @@ Then **Scan CloudTrail**. The app:
 
 1. Paginates `LookupEvents` for `AssumeRoleWithWebIdentity` in each selected region
 2. Keeps events from `token.actions.githubusercontent.com` (GitHub OIDC)
-3. Aggregates by org/repo (and workflow when present) × role
-4. Streams pages into a live ECharts Sankey (`org → repo → branch|env → role`) as assumes arrive; branch/env column toggle; click for detail; export CSV
+3. Aggregates by org/repo × branch/env × role
+4. Streams pages into a live ECharts Sankey (`org → repo → branch|env → role`) as assumes arrive; branch/env column toggle; org/repo wildcard filters (`savings*`, `*api`); click for detail; export CSV
 
 ```bash
 npm run build     # → web/dist (relative asset paths for GitHub Pages)
@@ -57,9 +57,9 @@ Minimum for the scan identity:
 ## Limits
 
 - `LookupEvents` throttles easily (often HTTP 400 `Rate exceeded`). The scanner paces pages (~350ms), backs off with retries + jitter on throttle, and pauses between regions. Progress shows retry waits; Cancel still aborts mid-backoff.
-- Workflow file names are **best-effort**; CloudTrail often only has `repo:…:ref:…` subjects → `unknown` workflow bucket.
 - Roles appear only if they were **assumed** in the lookback window (no IAM ListRoles in v1).
-- Large graphs cap rare repos / branch-env values / roles into **other** buckets and grow the chart canvas so ECharts can layout; zoom out / pan to explore.
+- Large graphs cap rare repos / branch-env values / roles into **other** buckets. Flow thickness uses a sqrt scale so small paths stay visible; **scroll** over the chart expands vertical spacing (Ctrl/Cmd+scroll zooms; drag pans).
+- Click a Sankey node or flow to focus the bottom list on those leaf paths (`repo → branch/env → role`); **Show all flows** clears the selection.
 - Do not paste long-lived keys into a page you do not host/trust.
 
 ## Layout

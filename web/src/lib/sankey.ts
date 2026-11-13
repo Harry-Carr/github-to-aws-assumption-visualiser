@@ -7,7 +7,24 @@ import { detailForSelection } from "./aggregate";
 
 echarts.use([SankeyChart, TitleComponent, TooltipComponent, CanvasRenderer]);
 
-export type PathSelectHandler = (detail: PathDetail | null) => void;
+export type SankeySelection = {
+  kind: "node" | "link";
+  sourceOrId: string;
+  target?: string;
+};
+
+export type PathSelectHandler = (
+  detail: PathDetail | null,
+  selection: SankeySelection | null,
+) => void;
+
+export type SankeyRenderOptions = {
+  /**
+   * Vertical spacing multiplier (1 = compact, higher = taller chart / more
+   * separation between small flows). Driven by scroll-to-expand.
+   */
+  spacing?: number;
+};
 
 /**
  * Link strength → accent teal depth (--accent #3ed6c6).
@@ -23,6 +40,11 @@ export function countToAccent(count: number, maxCount: number): string {
   return `rgb(${r},${g},${b})`;
 }
 
+/** Compress giant paths so small flows stay visible; floor avoids hairlines. */
+export function visualWeight(count: number): number {
+  return Math.max(0.4, Math.sqrt(Math.max(0, count)));
+}
+
 const NODE_GREY = "#2e3a38";
 const NODE_BORDER = "#2a9d90";
 
@@ -30,7 +52,7 @@ export function createSankey(
   el: HTMLElement,
   onSelect: PathSelectHandler,
 ): {
-  render: (model: SankeyModel) => void;
+  render: (model: SankeyModel, opts?: SankeyRenderOptions) => void;
   dispose: () => void;
 } {
   const chart = echarts.init(el, undefined, { renderer: "canvas" });
@@ -45,10 +67,9 @@ export function createSankey(
 
   chart.on("click", (params) => {
     if (!lastModel) {
-      onSelect(null);
+      onSelect(null, null);
       return;
     }
-    // Sankey edges: dataType edge; nodes: node (also accept missing dataType + seriesType)
     const isEdge =
       params.dataType === "edge" ||
       (params.seriesType === "sankey" &&
@@ -68,32 +89,44 @@ export function createSankey(
       const data = params.data as { source?: string | number; target?: string | number };
       const source = resolveNodeId(data.source);
       const target = resolveNodeId(data.target);
-      onSelect(detailForSelection(lastModel, "link", source, target));
+      const selection: SankeySelection = {
+        kind: "link",
+        sourceOrId: source,
+        target,
+      };
+      onSelect(
+        detailForSelection(lastModel, "link", source, target),
+        selection,
+      );
       return;
     }
     if (isNode) {
       const data = params.data as { name?: string };
-      // ECharts sankey uses `name` as node id when we set name=id
-      onSelect(detailForSelection(lastModel, "node", String(data.name || "")));
+      const id = String(data.name || "");
+      const selection: SankeySelection = { kind: "node", sourceOrId: id };
+      onSelect(detailForSelection(lastModel, "node", id), selection);
       return;
     }
-    onSelect(null);
+    onSelect(null, null);
   });
 
-  const render = (model: SankeyModel) => {
+  const render = (model: SankeyModel, opts: SankeyRenderOptions = {}) => {
     lastModel = model;
     const n = model.nodes.length;
     const canvas = el.parentElement;
-    const layout = layoutMetrics(model);
+    const spacing = Math.max(1, opts.spacing ?? 1);
+    const layout = layoutMetrics(model, spacing);
 
-    // Tall canvas when a column is dense — viewport pans/zooms over it.
     el.style.width = "100%";
     el.style.height = `${layout.height}px`;
     if (canvas) {
       canvas.style.width = "100%";
       canvas.style.height = `${layout.height}px`;
     }
-    chart.resize({ width: el.clientWidth || el.offsetWidth, height: layout.height });
+    chart.resize({
+      width: el.clientWidth || el.offsetWidth,
+      height: layout.height,
+    });
 
     if (n === 0 || model.links.length === 0) {
       chart.clear();
@@ -116,20 +149,23 @@ export function createSankey(
 
     const idToDepth = new Map(model.nodes.map((node) => [node.id, node.depth]));
     const idToCount = new Map(model.nodes.map((node) => [node.id, node.count]));
-    // Hide the noisiest labels when a column is packed; tooltip still has names.
-    const labelFloor = layout.maxCol > 48 ? model.maxLinkValue * 0.08 : 0;
+    const linkCount = new Map(
+      model.links.map((l) => [`${l.source}\0${l.target}`, l.value] as const),
+    );
+    const labelFloor =
+      layout.maxCol > 48 ? model.maxLinkValue * 0.08 : 0;
 
     const nodes = model.nodes.map((node) => ({
       name: node.id,
       depth: node.depth,
-      value: node.count,
+      value: visualWeight(node.count),
       itemStyle: {
         color: NODE_GREY,
         borderColor: NODE_BORDER,
         borderWidth: 1,
       },
       label: {
-        show: node.count >= labelFloor,
+        show: node.count >= labelFloor || spacing >= 1.5,
         color: "#f4f4f5",
         fontFamily: "DM Sans, sans-serif",
         fontSize: layout.labelSize,
@@ -141,10 +177,10 @@ export function createSankey(
     const links = model.links.map((link) => ({
       source: link.source,
       target: link.target,
-      value: link.value,
+      value: visualWeight(link.value),
       lineStyle: {
         color: countToAccent(link.value, model.maxLinkValue),
-        opacity: 0.7,
+        opacity: 0.72,
         curveness: 0.5,
       },
       emphasis: {
@@ -179,9 +215,13 @@ export function createSankey(
             };
           }) => {
             if (p.dataType === "edge" && p.data) {
-              const src = shortLabel(String(p.data.source || ""), model);
-              const tgt = shortLabel(String(p.data.target || ""), model);
-              return `<strong>${src}</strong> → <strong>${tgt}</strong><br/>assumes: ${p.data.value}`;
+              const srcId = resolveNodeId(p.data.source);
+              const tgtId = resolveNodeId(p.data.target);
+              const real =
+                linkCount.get(`${srcId}\0${tgtId}`) ?? p.data.value ?? 0;
+              const src = shortLabel(srcId, model);
+              const tgt = shortLabel(tgtId, model);
+              return `<strong>${src}</strong> → <strong>${tgt}</strong><br/>assumes: ${real}`;
             }
             if (p.dataType === "node") {
               const id = String(p.data?.name || p.name || "");
@@ -195,7 +235,7 @@ export function createSankey(
                       ? "Branch / env"
                       : "IAM role";
               return `<strong>${shortLabel(id, model)}</strong><br/>${stage}<br/>assumes: ${
-                idToCount.get(id) ?? p.value ?? 0
+                idToCount.get(id) ?? 0
               }`;
             }
             return "";
@@ -240,7 +280,10 @@ export function createSankey(
   };
 }
 
-function layoutMetrics(model: SankeyModel): {
+function layoutMetrics(
+  model: SankeyModel,
+  spacing: number,
+): {
   maxCol: number;
   nodeGap: number;
   nodeWidth: number;
@@ -254,11 +297,17 @@ function layoutMetrics(model: SankeyModel): {
     }
   }
   const maxCol = Math.max(1, ...byDepth);
-  const nodeGap = maxCol > 60 ? 2 : maxCol > 40 ? 4 : maxCol > 24 ? 8 : 14;
+  const baseGap = maxCol > 60 ? 2 : maxCol > 40 ? 4 : maxCol > 24 ? 8 : 14;
+  // Scroll-expand grows gap + slot height so small flows separate.
+  const nodeGap = Math.max(2, Math.round(baseGap * Math.min(spacing, 3)));
+  const slot = (10 + baseGap) * spacing;
   const nodeWidth = maxCol > 40 ? 10 : 14;
-  const labelSize = maxCol > 48 ? 9 : maxCol > 28 ? 10 : 12;
-  // Enough vertical room for the densest column so links stay attached.
-  const height = Math.min(14_000, Math.max(360, maxCol * (10 + nodeGap) + 64));
+  const labelSize =
+    spacing >= 2 ? 12 : maxCol > 48 ? 9 : maxCol > 28 ? 10 : 12;
+  const height = Math.min(
+    24_000,
+    Math.max(360, Math.round(maxCol * slot + 64)),
+  );
   return { maxCol, nodeGap, nodeWidth, labelSize, height };
 }
 
@@ -281,7 +330,6 @@ function shortLabel(id: string, model: SankeyModel): string {
   if (id.startsWith("role:")) return id.slice(5);
   if (id.startsWith("branch:") || id.startsWith("environment:")) {
     const rest = id.includes(":") ? id.slice(id.indexOf(":") + 1) : id;
-    // repoFull:mid — take last segment
     const idx = rest.lastIndexOf(":");
     return idx >= 0 ? rest.slice(idx + 1) : rest;
   }

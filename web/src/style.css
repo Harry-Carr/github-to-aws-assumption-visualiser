@@ -648,6 +648,24 @@ button:disabled {
   accent-color: var(--accent);
 }
 
+.table-panel-head {
+  align-items: flex-start;
+}
+
+.table-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.table-sub {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
 .table-wrap {
   overflow-x: auto;
   border: 1px solid var(--line);
@@ -683,9 +701,33 @@ td {
   color: var(--ink);
 }
 
+td.code,
 td code {
   color: var(--accent);
   font-size: 0.8rem;
+}
+
+.count-cell {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  white-space: nowrap;
+  width: 4.5rem;
+}
+
+.flow-cell {
+  min-width: 16rem;
+}
+
+.flow-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.4rem;
+}
+
+.flow-arrow {
+  color: var(--muted);
+  font-size: 0.75rem;
 }
 
 .empty {

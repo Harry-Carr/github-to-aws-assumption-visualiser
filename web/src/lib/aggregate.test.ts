@@ -1,7 +1,10 @@
 import {
   buildSankey,
   detailForSelection,
+  matchingPaths,
+  matchWildcard,
   resolveMid,
+  tableRowsFromPaths,
   type FilterState,
 } from "./aggregate";
 import type { ParsedAssume } from "./githubIdentity";
@@ -49,11 +52,19 @@ assert(resolveMid(both, "branch").label === "main", "prefer branch when selected
 assert(resolveMid(both, "environment").label === "prod", "prefer env when selected");
 
 // Aggregation: org→repo link sums all leaf paths (12+1=13)
+assert(matchWildcard("", "x"), "empty pattern matches");
+assert(matchWildcard("savings*", "savings-prod"), "prefix *");
+assert(matchWildcard("*savings", "my-savings"), "suffix *");
+assert(matchWildcard("*save*", "my-save-now"), "contains *");
+assert(!matchWildcard("savings*", "prod-savings"), "prefix reject");
+assert(matchWildcard("Acme", "acme"), "exact case-insensitive");
+assert(!matchWildcard("Acme", "AcmeCorp"), "exact no partial without *");
+
 const filters: FilterState = {
   org: "",
+  repo: "",
   role: "",
   minCount: 1,
-  hideUnknownWorkflow: false,
   hideUnknownMid: false,
   midStage: "environment",
 };
@@ -95,6 +106,15 @@ const leaf = detailForSelection(
 );
 assert(leaf?.count === 12, `leaf link should be 12, got ${leaf?.count}`);
 
+const rolePaths = matchingPaths(model, "node", "role:role-a");
+assert(rolePaths.length >= 1, "matchingPaths returns role paths");
+assert(
+  rolePaths.every((p) => p.roleName === "role-a"),
+  "matchingPaths scoped to role",
+);
+const roleRows = tableRowsFromPaths(rolePaths);
+assert(roleRows[0]?.roleName === "role-a", "tableRowsFromPaths keeps role");
+
 // High-cardinality mid collapse: keep top mids, roll rest into other
 const busyFilters: FilterState = { ...filters, midStage: "branch", minCount: 1 };
 const busyRows: ParsedAssume[] = [];
@@ -122,6 +142,30 @@ assert(
 assert(
   midNodes.some((n) => n.name.startsWith("other")),
   "other mid bucket present",
+);
+
+const wildcardRows: ParsedAssume[] = [
+  row({ org: "savings-prod", repo: "ledger", repoFull: "savings-prod/ledger" }),
+  row({ org: "payments", repo: "savings-api", repoFull: "payments/savings-api" }),
+  row({ org: "other", repo: "misc", repoFull: "other/misc" }),
+];
+const byOrg = buildSankey(wildcardRows, { ...filters, org: "savings*" });
+assert(
+  byOrg.nodes.some((n) => n.id === "org:savings-prod"),
+  "org savings* keeps savings-prod",
+);
+assert(
+  !byOrg.nodes.some((n) => n.id === "org:payments"),
+  "org savings* drops payments",
+);
+const byRepo = buildSankey(wildcardRows, { ...filters, repo: "*savings*" });
+assert(
+  byRepo.nodes.some((n) => n.id === "repo:payments/savings-api"),
+  "repo *savings* keeps savings-api",
+);
+assert(
+  !byRepo.nodes.some((n) => n.id === "repo:other/misc"),
+  "repo *savings* drops misc",
 );
 
 console.log("aggregate resolveMid + selection tests ok");

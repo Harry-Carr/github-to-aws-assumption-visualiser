@@ -3,13 +3,28 @@ import type { ParsedAssume } from "./githubIdentity";
 export type MidStage = "branch" | "environment";
 
 export type FilterState = {
+  /** Org name glob (`savings*`, `*corp`). Empty = all. */
   org: string;
+  /** Repo short or `org/repo` glob (`*api`, `payments*`). Empty = all. */
+  repo: string;
   role: string;
   minCount: number;
-  hideUnknownWorkflow: boolean;
   hideUnknownMid: boolean;
   midStage: MidStage;
 };
+
+/**
+ * Glob match with `*` = any run of chars. Case-insensitive.
+ * No `*` → exact match. Empty pattern → always true.
+ */
+export function matchWildcard(pattern: string, value: string): boolean {
+  const p = pattern.trim();
+  if (!p) return true;
+  const escaped = p
+    .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`, "i").test(value);
+}
 
 export type SankeyNode = {
   id: string;
@@ -46,7 +61,6 @@ export type PathDetail = {
   roleName: string;
   roleArn: string;
   count: number;
-  workflows: Map<string, number>;
   subjects: string[];
   eventTimes: string[];
   /** How many fine-grained paths were rolled into this selection */
@@ -111,9 +125,14 @@ function pathKey(
 }
 
 function passesFilters(row: ParsedAssume, filters: FilterState): boolean {
-  if (filters.org && row.org !== filters.org) return false;
+  if (filters.org && !matchWildcard(filters.org, row.org)) return false;
+  if (filters.repo) {
+    const repoOk =
+      matchWildcard(filters.repo, row.repo) ||
+      matchWildcard(filters.repo, row.repoFull);
+    if (!repoOk) return false;
+  }
   if (filters.role && row.roleName !== filters.role) return false;
-  if (filters.hideUnknownWorkflow && row.workflow === "unknown") return false;
   if (filters.hideUnknownMid) {
     if (resolveMid(row, filters.midStage).label === "unknown") return false;
   }
@@ -146,7 +165,6 @@ export function buildSankey(
         roleName: row.roleName,
         roleArn: row.roleArn,
         count: 0,
-        workflows: new Map(),
         subjects: [],
         eventTimes: [],
         pathCount: 1,
@@ -155,10 +173,6 @@ export function buildSankey(
       paths.set(key, path);
     }
     path.count += 1;
-    path.workflows.set(
-      row.workflow,
-      (path.workflows.get(row.workflow) || 0) + 1,
-    );
     if (
       row.subject &&
       path.subjects.length < 20 &&
@@ -371,7 +385,6 @@ export function collapseHighCardinality(
         roleName,
         roleArn,
         count: 0,
-        workflows: new Map(),
         subjects: [],
         eventTimes: [],
         pathCount: 0,
@@ -381,9 +394,6 @@ export function collapseHighCardinality(
     }
     agg.count += p.count;
     agg.pathCount += p.pathCount;
-    for (const [wf, n] of p.workflows) {
-      agg.workflows.set(wf, (agg.workflows.get(wf) || 0) + n);
-    }
     for (const s of p.subjects) {
       if (agg.subjects.length < 20 && !agg.subjects.includes(s)) {
         agg.subjects.push(s);
@@ -404,14 +414,13 @@ export type TableRow = {
   org: string;
   mid: string;
   count: number;
-  workflows: string;
 };
 
 export function buildTableRows(
   rows: ParsedAssume[],
   filters: FilterState,
 ): TableRow[] {
-  const map = new Map<string, TableRow & { wf: Map<string, number> }>();
+  const map = new Map<string, TableRow>();
 
   for (const row of rows) {
     if (!passesFilters(row, filters)) continue;
@@ -426,31 +435,16 @@ export function buildTableRows(
         org: row.org,
         mid,
         count: 0,
-        workflows: "",
-        wf: new Map(),
       };
       map.set(key, entry);
     }
     entry.count += 1;
-    entry.wf.set(row.workflow, (entry.wf.get(row.workflow) || 0) + 1);
   }
 
   const out: TableRow[] = [];
   for (const entry of map.values()) {
     if (entry.count < filters.minCount) continue;
-    const workflows = [...entry.wf.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .map(([name, n]) => `${name} (${n})`)
-      .join("; ");
-    out.push({
-      roleName: entry.roleName,
-      roleArn: entry.roleArn,
-      repoFull: entry.repoFull,
-      org: entry.org,
-      mid: entry.mid,
-      count: entry.count,
-      workflows,
-    });
+    out.push({ ...entry });
   }
 
   out.sort((a, b) => b.count - a.count || a.roleName.localeCompare(b.roleName));
@@ -459,15 +453,7 @@ export function buildTableRows(
 
 export function toCsv(rows: TableRow[], midStage: MidStage): string {
   const midCol = midStage === "branch" ? "branch" : "environment";
-  const header = [
-    "roleName",
-    "roleArn",
-    "org",
-    "repo",
-    midCol,
-    "count",
-    "workflows",
-  ];
+  const header = ["roleName", "roleArn", "org", "repo", midCol, "count"];
   const escape = (v: string | number) => {
     const s = String(v);
     if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
@@ -476,7 +462,7 @@ export function toCsv(rows: TableRow[], midStage: MidStage): string {
   const lines = [header.join(",")];
   for (const r of rows) {
     lines.push(
-      [r.roleName, r.roleArn, r.org, r.repoFull, r.mid, r.count, r.workflows]
+      [r.roleName, r.roleArn, r.org, r.repoFull, r.mid, r.count]
         .map(escape)
         .join(","),
     );
@@ -539,6 +525,35 @@ function uniqueOrJoin(values: string[]): string {
   return `${u.slice(0, 2).join(", ")} +${u.length - 2} more`;
 }
 
+/** Fine-grained paths under a sankey node or link (table + detail). */
+export function matchingPaths(
+  model: SankeyModel,
+  kind: "node" | "link",
+  sourceOrId: string,
+  target?: string,
+): PathDetail[] {
+  return [...model.paths.values()]
+    .filter((p) => pathMatchesSelection(p, kind, sourceOrId, target))
+    .sort(
+      (a, b) =>
+        b.count - a.count ||
+        a.repoFull.localeCompare(b.repoFull) ||
+        a.roleName.localeCompare(b.roleName),
+    );
+}
+
+/** Table rows from already-matched path details (selection-scoped list). */
+export function tableRowsFromPaths(paths: PathDetail[]): TableRow[] {
+  return paths.map((p) => ({
+    roleName: p.roleName,
+    roleArn: p.roleArn,
+    repoFull: p.repoFull,
+    org: p.org,
+    mid: p.midLabel,
+    count: p.count,
+  }));
+}
+
 /** Aggregate all fine-grained paths under a sankey node or link (matches tooltip totals). */
 export function detailForSelection(
   model: SankeyModel,
@@ -546,21 +561,15 @@ export function detailForSelection(
   sourceOrId: string,
   target?: string,
 ): PathDetail | null {
-  const matched = [...model.paths.values()].filter((p) =>
-    pathMatchesSelection(p, kind, sourceOrId, target),
-  );
+  const matched = matchingPaths(model, kind, sourceOrId, target);
   if (!matched.length) return null;
 
-  const workflows = new Map<string, number>();
   const subjects: string[] = [];
   const eventTimes: string[] = [];
   let count = 0;
 
   for (const p of matched) {
     count += p.count;
-    for (const [wf, n] of p.workflows) {
-      workflows.set(wf, (workflows.get(wf) || 0) + n);
-    }
     for (const s of p.subjects) {
       if (subjects.length < 20 && !subjects.includes(s)) subjects.push(s);
     }
@@ -586,7 +595,6 @@ export function detailForSelection(
     roleName: uniqueOrJoin(roles),
     roleArn: uniqueOrJoin(arns),
     count,
-    workflows,
     subjects,
     eventTimes,
     pathCount: matched.length,

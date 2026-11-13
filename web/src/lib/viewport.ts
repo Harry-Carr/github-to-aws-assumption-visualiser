@@ -1,4 +1,4 @@
-/** Zoom + pan for a child canvas inside an overflow-hidden viewport. */
+/** Pan + zoom for a child canvas; wheel expands flow spacing by default. */
 
 export type ViewportHandle = {
   reset: () => void;
@@ -13,6 +13,11 @@ type Options = {
   maxScale?: number;
   step?: number;
   onChange?: (scale: number) => void;
+  /**
+   * Plain wheel (no Ctrl/Meta): expand/contract flow spacing instead of zoom.
+   * Return false to fall through to zoom. Ctrl/Meta+wheel always zooms.
+   */
+  onSpacingWheel?: (direction: 1 | -1, event: WheelEvent) => boolean | void;
 };
 
 export function attachViewport(
@@ -43,7 +48,6 @@ export function attachViewport(
   const zoomAt = (next: number, cx: number, cy: number) => {
     const clamped = Math.min(maxScale, Math.max(minScale, next));
     if (clamped === scale) return;
-    // Keep point under cursor stable
     const rect = viewport.getBoundingClientRect();
     const x = cx - rect.left;
     const y = cy - rect.top;
@@ -57,7 +61,12 @@ export function attachViewport(
 
   const onWheel = (e: WheelEvent) => {
     e.preventDefault();
-    const direction = e.deltaY > 0 ? -1 : 1;
+    const direction: 1 | -1 = e.deltaY > 0 ? -1 : 1;
+    const wantZoom = e.ctrlKey || e.metaKey || !options.onSpacingWheel;
+    if (!wantZoom && options.onSpacingWheel) {
+      const handled = options.onSpacingWheel(direction, e);
+      if (handled !== false) return;
+    }
     zoomAt(scale * (1 + direction * step), e.clientX, e.clientY);
   };
 
