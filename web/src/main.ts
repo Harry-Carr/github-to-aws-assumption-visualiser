@@ -615,6 +615,7 @@ function onSankeySelect(
 function clearSankeySelection() {
   activeSelection = null;
   activeDetail = null;
+  sankey?.clearSelection();
   renderDetail(null);
   renderAssumesTable();
 }
@@ -683,7 +684,7 @@ function renderAll(opts: RenderOpts = {}) {
     if (sankey) {
       sankey.render(
         { nodes: [], links: [], paths: new Map(), maxLinkValue: 1 },
-        { spacing: flowSpacing },
+        { spacing: flowSpacing, selection: null },
       );
     }
     renderDetail(null);
@@ -701,17 +702,9 @@ function renderAll(opts: RenderOpts = {}) {
     updateViewLabel();
     activeSelection = null;
     activeDetail = null;
-  }
-  sankey!.render(model, { spacing: flowSpacing });
-  setTruncationNote(model.truncation);
-  if (!incremental) {
-    renderDetail(null);
-    viewport?.reset();
   } else if (firstReveal) {
     activeSelection = null;
     activeDetail = null;
-    renderDetail(null);
-    viewport?.reset();
   } else if (activeSelection) {
     activeDetail = detailForSelection(
       model,
@@ -722,6 +715,19 @@ function renderAll(opts: RenderOpts = {}) {
     if (!activeDetail) {
       activeSelection = null;
     }
+  }
+  sankey!.render(model, {
+    spacing: flowSpacing,
+    selection: activeSelection,
+  });
+  setTruncationNote(model.truncation);
+  if (!incremental) {
+    renderDetail(null);
+    viewport?.reset();
+  } else if (firstReveal) {
+    renderDetail(null);
+    viewport?.reset();
+  } else if (activeSelection) {
     renderDetail(activeDetail);
   }
   revealedLiveResults = true;

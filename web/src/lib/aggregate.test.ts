@@ -1,6 +1,7 @@
 import {
   buildSankey,
   detailForSelection,
+  graphKeysForSelection,
   matchingPaths,
   matchWildcard,
   resolveMid,
@@ -114,6 +115,9 @@ assert(
 );
 const roleRows = tableRowsFromPaths(rolePaths);
 assert(roleRows[0]?.roleName === "role-a", "tableRowsFromPaths keeps role");
+const keys = graphKeysForSelection(model, "node", "role:role-a");
+assert(keys.nodeIds.has("role:role-a"), "graphKeys includes role node");
+assert(keys.linkKeys.size >= 1, "graphKeys includes path edges");
 
 // High-cardinality mid collapse: keep top mids, roll rest into other
 const busyFilters: FilterState = { ...filters, midStage: "branch", minCount: 1 };

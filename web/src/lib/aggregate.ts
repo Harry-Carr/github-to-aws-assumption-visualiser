@@ -542,6 +542,31 @@ export function matchingPaths(
     );
 }
 
+/** Graph edges + nodes touched by a sankey selection (for highlight). */
+export function graphKeysForSelection(
+  model: SankeyModel,
+  kind: "node" | "link",
+  sourceOrId: string,
+  target?: string,
+): { linkKeys: Set<string>; nodeIds: Set<string> } {
+  const linkKeys = new Set<string>();
+  const nodeIds = new Set<string>();
+  for (const p of matchingPaths(model, kind, sourceOrId, target)) {
+    const orgId = `org:${p.org}`;
+    const repoId = `repo:${p.repoFull}`;
+    const mId = midId(p.repoFull, p.midLabel, p.midKind);
+    const roleId = `role:${p.roleName}`;
+    nodeIds.add(orgId);
+    nodeIds.add(repoId);
+    nodeIds.add(mId);
+    nodeIds.add(roleId);
+    linkKeys.add(`${orgId}\0${repoId}`);
+    linkKeys.add(`${repoId}\0${mId}`);
+    linkKeys.add(`${mId}\0${roleId}`);
+  }
+  return { linkKeys, nodeIds };
+}
+
 /** Table rows from already-matched path details (selection-scoped list). */
 export function tableRowsFromPaths(paths: PathDetail[]): TableRow[] {
   return paths.map((p) => ({

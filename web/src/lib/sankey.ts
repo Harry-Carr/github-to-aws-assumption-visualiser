@@ -3,7 +3,7 @@ import { SankeyChart } from "echarts/charts";
 import { TitleComponent, TooltipComponent } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import type { PathDetail, SankeyModel } from "./aggregate";
-import { detailForSelection } from "./aggregate";
+import { detailForSelection, graphKeysForSelection } from "./aggregate";
 
 echarts.use([SankeyChart, TitleComponent, TooltipComponent, CanvasRenderer]);
 
@@ -24,6 +24,8 @@ export type SankeyRenderOptions = {
    * separation between small flows). Driven by scroll-to-expand.
    */
   spacing?: number;
+  /** When set (including null), syncs click-highlight state from the host. */
+  selection?: SankeySelection | null;
 };
 
 /**
@@ -40,17 +42,26 @@ export function countToAccent(count: number, maxCount: number): string {
   return `rgb(${r},${g},${b})`;
 }
 
+const ACCENT = "#3ed6c6";
 const NODE_GREY = "#2e3a38";
+const NODE_ACTIVE = "#3a5c58";
+const NODE_DIM = "#1c2221";
+const LINK_DIM = "#2a3332";
+const LABEL_DIM = "#6b7280";
+const LABEL_ON = "#f4f4f5";
 
 export function createSankey(
   el: HTMLElement,
   onSelect: PathSelectHandler,
 ): {
   render: (model: SankeyModel, opts?: SankeyRenderOptions) => void;
+  clearSelection: () => void;
   dispose: () => void;
 } {
   const chart = echarts.init(el, undefined, { renderer: "canvas" });
   let lastModel: SankeyModel | null = null;
+  let lastSpacing = 1;
+  let activeSelection: SankeySelection | null = null;
 
   const resolveNodeId = (ref: unknown): string => {
     if (typeof ref === "number" && lastModel) {
@@ -59,9 +70,31 @@ export function createSankey(
     return String(ref ?? "");
   };
 
+  const notify = (selection: SankeySelection | null) => {
+    if (!selection || !lastModel) {
+      onSelect(null, null);
+      return;
+    }
+    onSelect(
+      detailForSelection(
+        lastModel,
+        selection.kind,
+        selection.sourceOrId,
+        selection.target,
+      ),
+      selection,
+    );
+  };
+
+  const setSelection = (selection: SankeySelection | null, emit: boolean) => {
+    activeSelection = selection;
+    if (lastModel) paint(lastModel, lastSpacing);
+    if (emit) notify(selection);
+  };
+
   chart.on("click", (params) => {
     if (!lastModel) {
-      onSelect(null, null);
+      setSelection(null, true);
       return;
     }
     const isEdge =
@@ -80,38 +113,36 @@ export function createSankey(
         !("source" in (params.data as object)));
 
     if (isEdge) {
-      const data = params.data as { source?: string | number; target?: string | number };
+      const data = params.data as {
+        source?: string | number;
+        target?: string | number;
+      };
       const source = resolveNodeId(data.source);
       const target = resolveNodeId(data.target);
-      const selection: SankeySelection = {
-        kind: "link",
-        sourceOrId: source,
-        target,
-      };
-      onSelect(
-        detailForSelection(lastModel, "link", source, target),
-        selection,
-      );
+      setSelection({ kind: "link", sourceOrId: source, target }, true);
       return;
     }
     if (isNode) {
       const data = params.data as { name?: string };
       const id = String(data.name || "");
-      const selection: SankeySelection = { kind: "node", sourceOrId: id };
-      onSelect(detailForSelection(lastModel, "node", id), selection);
+      setSelection({ kind: "node", sourceOrId: id }, true);
       return;
     }
-    onSelect(null, null);
+    setSelection(null, true);
   });
 
-  const render = (model: SankeyModel, opts: SankeyRenderOptions = {}) => {
-    lastModel = model;
+  // Blank chart area → clear highlight (series click has a target).
+  chart.getZr().on("click", (e) => {
+    if (e.target) return;
+    if (!activeSelection) return;
+    setSelection(null, true);
+  });
+
+  const paint = (model: SankeyModel, spacing: number) => {
     const n = model.nodes.length;
     const canvas = el.parentElement;
-    const spacing = Math.max(1, opts.spacing ?? 1);
     const layout = layoutMetrics(model, spacing);
     const viewportW = canvas?.parentElement?.clientWidth || 0;
-    // Floor at viewport so short graphs still fill the panel; grow with height.
     const width = Math.max(viewportW, layout.width);
 
     el.style.width = `${width}px`;
@@ -126,6 +157,7 @@ export function createSankey(
     });
 
     if (n === 0 || model.links.length === 0) {
+      activeSelection = null;
       chart.clear();
       chart.setOption({
         backgroundColor: "transparent",
@@ -134,7 +166,7 @@ export function createSankey(
           left: "center",
           top: "middle",
           textStyle: {
-            color: "#f4f4f5",
+            color: LABEL_ON,
             fontSize: 14,
             fontWeight: 400,
             fontFamily: "DM Sans, sans-serif",
@@ -144,6 +176,22 @@ export function createSankey(
       return;
     }
 
+    // Drop stale selection if it no longer matches anything.
+    let highlight: { linkKeys: Set<string>; nodeIds: Set<string> } | null =
+      null;
+    if (activeSelection) {
+      highlight = graphKeysForSelection(
+        model,
+        activeSelection.kind,
+        activeSelection.sourceOrId,
+        activeSelection.target,
+      );
+      if (!highlight.linkKeys.size && !highlight.nodeIds.size) {
+        activeSelection = null;
+        highlight = null;
+      }
+    }
+
     const idToDepth = new Map(model.nodes.map((node) => [node.id, node.depth]));
     const idToCount = new Map(model.nodes.map((node) => [node.id, node.count]));
     const linkCount = new Map(
@@ -151,44 +199,51 @@ export function createSankey(
     );
     const labelFloor =
       layout.maxCol > 48 ? model.maxLinkValue * 0.08 : 0;
+    const focused = Boolean(highlight);
 
-    // Raw counts only — non-linear weights (sqrt) break conservation, so
-    // sum(out) ≠ sum(in) and flows leave empty grey in the node bar.
-    const nodes = model.nodes.map((node) => ({
-      name: node.id,
-      depth: node.depth,
-      value: Math.max(1, node.count),
-      // No border — stroke sits outside the fill and leaves a gap before links.
-      itemStyle: {
-        color: NODE_GREY,
-        borderWidth: 0,
-      },
-      label: {
-        show: node.count >= labelFloor || spacing >= 1.5,
-        color: "#f4f4f5",
-        fontFamily: "DM Sans, sans-serif",
-        fontSize: layout.labelSize,
-        fontWeight: 500,
-        formatter: () => node.name,
-      },
-    }));
-
-    const links = model.links.map((link) => ({
-      source: link.source,
-      target: link.target,
-      value: Math.max(1, link.value),
-      lineStyle: {
-        color: countToAccent(link.value, model.maxLinkValue),
-        opacity: 0.72,
-        curveness: 0.5,
-      },
-      emphasis: {
-        lineStyle: {
-          opacity: 0.95,
-          color: countToAccent(link.value, model.maxLinkValue),
+    const nodes = model.nodes.map((node) => {
+      const on = !focused || highlight!.nodeIds.has(node.id);
+      return {
+        name: node.id,
+        depth: node.depth,
+        value: Math.max(1, node.count),
+        itemStyle: {
+          color: on ? (focused ? NODE_ACTIVE : NODE_GREY) : NODE_DIM,
+          borderWidth: 0,
+          opacity: on ? 1 : 0.35,
         },
-      },
-    }));
+        label: {
+          show: node.count >= labelFloor || spacing >= 1.5,
+          color: on ? LABEL_ON : LABEL_DIM,
+          fontFamily: "DM Sans, sans-serif",
+          fontSize: layout.labelSize,
+          fontWeight: on && focused ? 600 : 500,
+          formatter: () => node.name,
+        },
+      };
+    });
+
+    const links = model.links.map((link) => {
+      const key = `${link.source}\0${link.target}`;
+      const on = !focused || highlight!.linkKeys.has(key);
+      const base = countToAccent(link.value, model.maxLinkValue);
+      return {
+        source: link.source,
+        target: link.target,
+        value: Math.max(1, link.value),
+        lineStyle: {
+          color: on ? (focused ? ACCENT : base) : LINK_DIM,
+          opacity: on ? (focused ? 0.95 : 0.72) : 0.12,
+          curveness: 0.5,
+        },
+        emphasis: {
+          lineStyle: {
+            opacity: on ? 0.98 : 0.2,
+            color: on ? ACCENT : LINK_DIM,
+          },
+        },
+      };
+    });
 
     chart.setOption(
       {
@@ -199,7 +254,7 @@ export function createSankey(
           backgroundColor: "#121114",
           borderColor: "#202022",
           textStyle: {
-            color: "#f4f4f5",
+            color: LABEL_ON,
             fontFamily: "DM Sans, sans-serif",
           },
           formatter: (p: {
@@ -243,7 +298,11 @@ export function createSankey(
         series: [
           {
             type: "sankey",
-            emphasis: { focus: "adjacency" },
+            emphasis: { focus: focused ? "none" : "adjacency" },
+            blur: {
+              itemStyle: { opacity: 0.2 },
+              lineStyle: { opacity: 0.08 },
+            },
             nodeAlign: "justify",
             left: layout.padLeft,
             right: layout.padRight,
@@ -261,7 +320,7 @@ export function createSankey(
               fontFamily: "DM Sans, sans-serif",
               fontSize: layout.labelSize,
               fontWeight: 500,
-              color: "#f4f4f5",
+              color: LABEL_ON,
               distance: 6,
               overflow: "truncate",
               width: Math.max(64, layout.padRight - 16),
@@ -274,11 +333,25 @@ export function createSankey(
     );
   };
 
+  const render = (model: SankeyModel, opts: SankeyRenderOptions = {}) => {
+    lastModel = model;
+    lastSpacing = Math.max(1, opts.spacing ?? lastSpacing);
+    if (opts.selection !== undefined) {
+      activeSelection = opts.selection;
+    }
+    paint(model, lastSpacing);
+  };
+
   const onResize = () => chart.resize();
   window.addEventListener("resize", onResize);
 
   return {
     render,
+    /** Clear highlight only (no onSelect). Use after main already reset UI state. */
+    clearSelection: () => {
+      if (!activeSelection) return;
+      setSelection(null, false);
+    },
     dispose: () => {
       window.removeEventListener("resize", onResize);
       chart.dispose();
