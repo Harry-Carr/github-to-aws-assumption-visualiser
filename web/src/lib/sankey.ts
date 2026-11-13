@@ -116,15 +116,18 @@ export function createSankey(
     const canvas = el.parentElement;
     const spacing = Math.max(1, opts.spacing ?? 1);
     const layout = layoutMetrics(model, spacing);
+    const viewportW = canvas?.parentElement?.clientWidth || 0;
+    // Floor at viewport so short graphs still fill the panel; grow with height.
+    const width = Math.max(viewportW, layout.width);
 
-    el.style.width = "100%";
+    el.style.width = `${width}px`;
     el.style.height = `${layout.height}px`;
     if (canvas) {
-      canvas.style.width = "100%";
+      canvas.style.width = `${width}px`;
       canvas.style.height = `${layout.height}px`;
     }
     chart.resize({
-      width: el.clientWidth || el.offsetWidth,
+      width,
       height: layout.height,
     });
 
@@ -246,6 +249,10 @@ export function createSankey(
             type: "sankey",
             emphasis: { focus: "adjacency" },
             nodeAlign: "justify",
+            left: layout.padX,
+            right: layout.padX,
+            top: 16,
+            bottom: 16,
             nodeGap: layout.nodeGap,
             nodeWidth: layout.nodeWidth,
             layoutIterations: layout.maxCol > 40 ? 32 : 64,
@@ -289,6 +296,8 @@ function layoutMetrics(
   nodeWidth: number;
   labelSize: number;
   height: number;
+  width: number;
+  padX: number;
 } {
   const byDepth = [0, 0, 0, 0];
   for (const node of model.nodes) {
@@ -301,14 +310,22 @@ function layoutMetrics(
   // Scroll-expand grows gap + slot height so small flows separate.
   const nodeGap = Math.max(2, Math.round(baseGap * Math.min(spacing, 3)));
   const slot = (10 + baseGap) * spacing;
-  const nodeWidth = maxCol > 40 ? 10 : 14;
   const labelSize =
     spacing >= 2 ? 12 : maxCol > 48 ? 9 : maxCol > 28 ? 10 : 12;
   const height = Math.min(
     24_000,
     Math.max(360, Math.round(maxCol * slot + 64)),
   );
-  return { maxCol, nodeGap, nodeWidth, labelSize, height };
+  // Width tracks height so tall graphs stay ~landscape / square, not a thin strip.
+  // Extra bump from spacing keeps columns from crowding when scroll-expanding.
+  const width = Math.min(
+    14_000,
+    Math.max(720, Math.round(height * 0.92 + spacing * 120)),
+  );
+  const nodeWidth =
+    width > 2200 ? 22 : width > 1400 ? 18 : maxCol > 40 ? 10 : 14;
+  const padX = width > 1800 ? 48 : 24;
+  return { maxCol, nodeGap, nodeWidth, labelSize, height, width, padX };
 }
 
 function assumesEmptyMessage(model: SankeyModel): string {
