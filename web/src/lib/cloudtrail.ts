@@ -1,6 +1,7 @@
 import {
   CloudTrailClient,
   LookupEventsCommand,
+  type LookupEventsCommandInput,
   type LookupEventsCommandOutput,
 } from "@aws-sdk/client-cloudtrail";
 import { parseAssumeEvent, type ParsedAssume } from "./githubIdentity";
@@ -47,11 +48,26 @@ export type ScanOptions = {
   regions: string[];
   signal?: AbortSignal;
   onProgress?: (p: ScanProgress) => void;
+  /** Max attempts per LookupEvents page (default 8). */
+  maxRetries?: number;
+  /** Base backoff ms before first retry (default 750). */
+  retryBaseMs?: number;
+  /** Cap on backoff delay ms (default 20000). */
+  retryMaxMs?: number;
+  /** Pause between successful pages to reduce throttle (default 350). */
+  pageDelayMs?: number;
 };
+
+const DEFAULT_MAX_RETRIES = 8;
+const DEFAULT_RETRY_BASE_MS = 750;
+const DEFAULT_RETRY_MAX_MS = 20_000;
+const DEFAULT_PAGE_DELAY_MS = 350;
 
 function createClient(creds: AwsCreds, region: string): CloudTrailClient {
   return new CloudTrailClient({
     region,
+    // SDK retries help some faults; we also wrap LookupEvents for Rate exceeded (often 400).
+    maxAttempts: 3,
     credentials: {
       accessKeyId: creds.accessKeyId,
       secretAccessKey: creds.secretAccessKey,
@@ -74,6 +90,111 @@ function parseCloudTrailEvent(
   return null;
 }
 
+function errMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+function errName(err: unknown): string {
+  if (err && typeof err === "object" && "name" in err) {
+    return String((err as { name: unknown }).name);
+  }
+  return "";
+}
+
+function errHttpStatus(err: unknown): number | undefined {
+  if (err && typeof err === "object" && "$metadata" in err) {
+    const meta = (err as { $metadata?: { httpStatusCode?: number } }).$metadata;
+    return meta?.httpStatusCode;
+  }
+  return undefined;
+}
+
+/** CloudTrail often returns HTTP 400 "Rate exceeded" rather than a clean 429. */
+export function isThrottleError(err: unknown): boolean {
+  const name = errName(err);
+  const msg = errMessage(err);
+  const status = errHttpStatus(err);
+
+  if (
+    name === "ThrottlingException" ||
+    name === "Throttling" ||
+    name === "TooManyRequestsException" ||
+    name === "RequestLimitExceeded" ||
+    name === "ProvisionedThroughputExceededException" ||
+    name === "TimeoutError"
+  ) {
+    return true;
+  }
+
+  if (/rate\s*exceeded|throttl|slow\s*down|try\s*again|too\s*many\s*requests/i.test(msg)) {
+    return true;
+  }
+
+  if (status === 429) return true;
+  // LookupEvents throttle commonly surfaces as 400 with "Rate exceeded"
+  if (status === 400 && /rate\s*exceeded|throttl/i.test(msg)) return true;
+
+  return false;
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Scan cancelled", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Scan cancelled", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function backoffMs(attempt: number, baseMs: number, maxMs: number): number {
+  // attempt 1 → base, then exponential; add jitter so multi-region scans don't sync
+  const exp = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
+  const jitter = Math.floor(Math.random() * Math.min(250, exp * 0.25));
+  return Math.min(maxMs, exp + jitter);
+}
+
+async function lookupEventsWithRetry(
+  client: CloudTrailClient,
+  input: LookupEventsCommandInput,
+  options: {
+    signal?: AbortSignal;
+    maxRetries: number;
+    retryBaseMs: number;
+    retryMaxMs: number;
+    onRetry: (attempt: number, waitMs: number, err: unknown) => void;
+  },
+): Promise<LookupEventsCommandOutput> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= options.maxRetries; attempt++) {
+    if (options.signal?.aborted) {
+      throw new DOMException("Scan cancelled", "AbortError");
+    }
+    try {
+      return await client.send(new LookupEventsCommand(input));
+    } catch (err) {
+      lastErr = err;
+      if (!isThrottleError(err) || attempt >= options.maxRetries) {
+        throw err;
+      }
+      const waitMs = backoffMs(attempt, options.retryBaseMs, options.retryMaxMs);
+      options.onRetry(attempt, waitMs, err);
+      await sleep(waitMs, options.signal);
+    }
+  }
+  throw lastErr;
+}
+
 async function scanOneRegion(
   creds: AwsCreds,
   region: string,
@@ -87,6 +208,10 @@ async function scanOneRegion(
   const client = createClient(creds, region);
   const results: ParsedAssume[] = [];
   let nextToken: string | undefined;
+  const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+  const retryBaseMs = options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS;
+  const retryMaxMs = options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS;
+  const pageDelayMs = options.pageDelayMs ?? DEFAULT_PAGE_DELAY_MS;
 
   const report = (status: string) => {
     options.onProgress?.({
@@ -108,8 +233,9 @@ async function scanOneRegion(
         throw new DOMException("Scan cancelled", "AbortError");
       }
 
-      const response = await client.send(
-        new LookupEventsCommand({
+      const response = await lookupEventsWithRetry(
+        client,
+        {
           LookupAttributes: [
             {
               AttributeKey: "EventName",
@@ -120,7 +246,18 @@ async function scanOneRegion(
           EndTime: end,
           MaxResults: 50,
           NextToken: nextToken,
-        }),
+        },
+        {
+          signal: options.signal,
+          maxRetries,
+          retryBaseMs,
+          retryMaxMs,
+          onRetry: (attempt, waitMs, err) => {
+            report(
+              `${region}: rate limited (${errMessage(err)}) — retry ${attempt}/${maxRetries - 1} in ${Math.round(waitMs / 1000)}s…`,
+            );
+          },
+        },
       );
 
       totals.pages += 1;
@@ -143,6 +280,11 @@ async function scanOneRegion(
           ? `${region}: page ${totals.pages} (${totals.rawEvents} events)…`
           : `${region}: done — ${results.length} GitHub OIDC assume(s)`,
       );
+
+      // Pace successful pages; LookupEvents throttles easily across regions.
+      if (nextToken && pageDelayMs > 0) {
+        await sleep(pageDelayMs, options.signal);
+      }
     } while (nextToken);
   } finally {
     client.destroy();
@@ -176,6 +318,7 @@ export async function scanGitHubAssumes(
   const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
   const results: ParsedAssume[] = [];
   const totals = { pages: 0, rawEvents: 0, githubEvents: 0 };
+  const pageDelayMs = options.pageDelayMs ?? DEFAULT_PAGE_DELAY_MS;
 
   options.onProgress?.({
     pages: 0,
@@ -201,6 +344,11 @@ export async function scanGitHubAssumes(
       regions.length,
     );
     results.push(...rows);
+
+    // Brief pause between regions so the next region's first page is less likely to 400.
+    if (i < regions.length - 1 && pageDelayMs > 0) {
+      await sleep(pageDelayMs * 2, options.signal);
+    }
   }
 
   options.onProgress?.({
